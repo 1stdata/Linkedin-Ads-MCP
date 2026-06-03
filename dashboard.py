@@ -7,8 +7,11 @@ pause/resume campaigns, and trigger the scheduler manually.
 Reuses API helpers from linkedin_ads_server.py — no duplicated logic.
 """
 
+import logging
 import os
 import sys
+import threading
+import time
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -512,6 +515,100 @@ def api_run_scheduler():
         "message": f"Processed {len(rules)} rule(s).",
         "actions": actions,
     })
+
+
+# ---------------------------------------------------------------------------
+# Background scheduler (runs every 30 minutes)
+# ---------------------------------------------------------------------------
+
+SCHEDULER_INTERVAL = int(os.environ.get("SCHEDULER_INTERVAL_MINUTES", 30)) * 60
+
+logger = logging.getLogger("scheduler")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
+
+
+def _run_scheduler_tick():
+    """Execute one scheduler pass — evaluate all rules and pause/resume."""
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+
+    schedules = _load_schedules()
+    rules = schedules.get("weekday_only", [])
+    if not rules:
+        return
+
+    DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+    for rule in rules:
+        account_id = rule["account_id"]
+        campaign_id = rule["campaign_id"]
+        campaign_name = rule.get("campaign_name", campaign_id)
+        tz_name = rule.get("timezone", "UTC")
+
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            logger.warning("Invalid timezone '%s' for campaign %s", tz_name, campaign_id)
+            continue
+
+        now = datetime.now(tz)
+        weekday = now.weekday()
+        current_time = now.strftime("%H:%M")
+
+        if "hours" in rule:
+            day_key = DAY_KEYS[weekday]
+            active_hours = rule["hours"].get(day_key, [])
+            desired = "ACTIVE" if now.hour in active_hours else "PAUSED"
+        else:
+            resume_time_str = rule.get("resume_time", "06:00")
+            pause_time_str = rule.get("pause_time", "18:00")
+            if weekday >= 5:
+                desired = "PAUSED"
+            elif weekday == 4 and current_time >= pause_time_str:
+                desired = "PAUSED"
+            elif weekday == 0 and current_time < resume_time_str:
+                desired = "PAUSED"
+            else:
+                desired = "ACTIVE"
+
+        body = {"patch": {"$set": {"status": desired}}}
+        extra_headers = {"X-RestLi-Method": "PARTIAL_UPDATE"}
+        data = linkedin_api_request(
+            "POST",
+            f"/adAccounts/{account_id}/adCampaigns/{campaign_id}",
+            json_body=body,
+            extra_headers=extra_headers,
+        )
+
+        if "error" in data:
+            logger.error("Failed %s for %s (%s): %s", desired, campaign_name, campaign_id, data["error"])
+        else:
+            logger.info("%s -> %s (%s) [%s %s, tz=%s]", desired, campaign_name, campaign_id, now.strftime("%A"), current_time, tz_name)
+
+
+def _scheduler_loop():
+    """Background loop that runs the scheduler every SCHEDULER_INTERVAL seconds."""
+    logger.info("Background scheduler started (interval=%d min)", SCHEDULER_INTERVAL // 60)
+    while True:
+        time.sleep(SCHEDULER_INTERVAL)
+        try:
+            logger.info("Scheduler tick starting...")
+            _run_scheduler_tick()
+            logger.info("Scheduler tick complete.")
+        except Exception as e:
+            logger.exception("Scheduler tick failed: %s", e)
+
+
+def start_background_scheduler():
+    """Start the scheduler in a daemon thread."""
+    t = threading.Thread(target=_scheduler_loop, daemon=True)
+    t.start()
+
+
+# Start the background scheduler when the module is loaded (works with gunicorn)
+start_background_scheduler()
 
 
 # ---------------------------------------------------------------------------
