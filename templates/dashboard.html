@@ -68,7 +68,7 @@
   .btn-outline:hover:not(:disabled) { background: var(--surface); }
 
   /* Main */
-  .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+  .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
   .section { margin-bottom: 32px; }
   .section-title {
     font-size: 16px;
@@ -337,12 +337,15 @@
             <th>Group</th>
             <th>Status</th>
             <th>Daily Budget</th>
+            <th>Bid</th>
+            <th>Avg Spend/Day</th>
+            <th>Pacing</th>
             <th>Schedule</th>
             <th>Actions</th>
           </tr>
         </thead>
         <tbody id="campaignTableBody">
-          <tr><td colspan="7" class="empty-state">Loading campaigns...</td></tr>
+          <tr><td colspan="10" class="empty-state">Loading campaigns...</td></tr>
         </tbody>
       </table>
     </div>
@@ -404,6 +407,48 @@
   </div>
 </div>
 
+<!-- Edit Campaign Modal -->
+<div class="modal-overlay" id="editCampaignModal">
+  <div class="modal" style="max-width:480px">
+    <h2>Edit Campaign</h2>
+    <input type="hidden" id="editCampaignId">
+    <input type="hidden" id="editCampaignCurrency">
+    <div class="form-group">
+      <label>Campaign</label>
+      <input type="text" id="editCampaignLabel" disabled>
+    </div>
+    <div class="form-group">
+      <label>Bid Strategy</label>
+      <select id="editBidStrategy" onchange="onBidStrategyChange()">
+        <option value="">— keep current —</option>
+        <option value="MAXIMUM_DELIVERY">MAXIMUM_DELIVERY</option>
+        <option value="TARGET_COST">TARGET_COST</option>
+        <option value="MANUAL_CPC">MANUAL_CPC</option>
+      </select>
+    </div>
+    <div class="form-group" id="editBidAmountGroup" style="display:none">
+      <label>Bid Amount</label>
+      <input type="number" id="editBidAmount" step="0.01" min="0" placeholder="e.g. 5.00">
+    </div>
+    <div class="form-group">
+      <label>Daily Budget</label>
+      <input type="number" id="editDailyBudget" step="0.01" min="0" placeholder="e.g. 50.00">
+    </div>
+    <div class="form-group">
+      <label>Pacing Strategy</label>
+      <select id="editPacingStrategy">
+        <option value="">— keep current —</option>
+        <option value="DAILY">DAILY</option>
+        <option value="LIFETIME">LIFETIME</option>
+      </select>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" onclick="closeEditModal()">Cancel</button>
+      <button class="btn btn-primary" id="editSaveBtn" onclick="saveEditCampaign()">Save</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const NON_TOGGLEABLE = new Set(["DRAFT", "ARCHIVED", "CANCELED"]);
 const DAY_KEYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
@@ -411,6 +456,7 @@ const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 let currentCampaigns = [];
 let campaignGroups = {};  // id -> name
+let analyticsData = {};   // campaign_id -> { avgDailySpend, totalSpend, currency }
 let gridHours = { sun:[], mon:[], tue:[], wed:[], thu:[], fri:[], sat:[] };
 let isDragging = false;
 let dragActivate = true;
@@ -513,11 +559,11 @@ async function loadCampaignGroups() {
 
 async function loadCampaigns() {
   const tbody = document.getElementById("campaignTableBody");
-  tbody.innerHTML = '<tr><td colspan="7" class="empty-state">Loading campaigns...</td></tr>';
+  tbody.innerHTML = '<tr><td colspan="10" class="empty-state">Loading campaigns...</td></tr>';
 
   const accountId = getAccountId();
   if (!accountId) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">Select an account above.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty-state">Select an account above.</td></tr>';
     return;
   }
 
@@ -533,9 +579,11 @@ async function loadCampaigns() {
     const data = await apiFetch("/api/campaigns" + qs);
     currentCampaigns = data.campaigns || [];
     renderCampaigns();
+    // Fire analytics load in background (non-blocking)
+    loadAnalytics();
   } catch (e) {
     showError("Failed to load campaigns: " + e.message);
-    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">Error loading campaigns.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty-state">Error loading campaigns.</td></tr>';
   }
 }
 
@@ -586,10 +634,37 @@ function summarizeSchedule(schedule) {
   return `<span class="badge badge-active">Enabled</span><br><span class="schedule-info">${esc(schedule.timezone)}</span>`;
 }
 
+function formatBidColumn(c) {
+  const strategy = c.bidStrategy || "—";
+  let display = `<span class="badge badge-draft">${esc(strategy)}</span>`;
+  if (c.unitCost && c.unitCost.amount) {
+    display += ` $${parseFloat(c.unitCost.amount).toFixed(2)}`;
+  }
+  return display;
+}
+
+function formatPacingColumn(c) {
+  const pacing = c.pacingStrategy || "—";
+  let display = `<span class="badge badge-draft">${esc(pacing)}</span>`;
+  if (c.runSchedule) {
+    const parts = [];
+    if (c.runSchedule.start) parts.push(c.runSchedule.start.split(" ")[0]);
+    if (c.runSchedule.end) parts.push(c.runSchedule.end.split(" ")[0]);
+    if (parts.length) display += `<br><span class="schedule-info">${parts.join(" – ")}</span>`;
+  }
+  return display;
+}
+
+function formatAvgSpend(campaignId) {
+  const a = analyticsData[campaignId];
+  if (!a) return '<span class="text-muted" data-spend-id="' + campaignId + '">...</span>';
+  return `$${a.avgDailySpend.toFixed(2)}`;
+}
+
 function renderCampaigns() {
   const tbody = document.getElementById("campaignTableBody");
   if (!currentCampaigns.length) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No campaigns found.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty-state">No campaigns found.</td></tr>';
     return;
   }
   tbody.innerHTML = currentCampaigns.map(c => {
@@ -599,10 +674,13 @@ function renderCampaigns() {
         ? `<button class="btn btn-sm btn-outline" onclick="toggleStatus('${c.id}', 'PAUSED', this)">Pause</button>`
         : `<button class="btn btn-sm btn-success" onclick="toggleStatus('${c.id}', 'ACTIVE', this)">Resume</button>`;
 
+    const editBtn = disabled ? "" :
+      `<button class="btn btn-sm btn-outline" onclick="openEditModal('${c.id}')">Edit</button>`;
+
     const scheduleBtn = disabled ? "" :
       c.schedule.enabled
-        ? `<button class="btn btn-sm btn-danger" onclick="removeSchedule('${c.id}', this)">Disable</button> <button class="btn btn-sm btn-outline" onclick="openModal('${c.id}', '${escapeAttr(c.name)}', true)">Edit</button>`
-        : `<button class="btn btn-sm btn-outline" onclick="openModal('${c.id}', '${escapeAttr(c.name)}', false)">Enable Schedule</button>`;
+        ? `<button class="btn btn-sm btn-danger" onclick="removeSchedule('${c.id}', this)">Disable</button> <button class="btn btn-sm btn-outline" onclick="openModal('${c.id}', '${escapeAttr(c.name)}', true)">Sched</button>`
+        : `<button class="btn btn-sm btn-outline" onclick="openModal('${c.id}', '${escapeAttr(c.name)}', false)">Sched</button>`;
 
     const groupName = c.campaignGroup ? esc(campaignGroups[c.campaignGroup] || c.campaignGroup) : "—";
 
@@ -612,8 +690,11 @@ function renderCampaigns() {
       <td>${groupName}</td>
       <td>${statusBadge(c.status)}</td>
       <td>${c.dailyBudget}</td>
+      <td>${formatBidColumn(c)}</td>
+      <td data-spend-id="${c.id}">${formatAvgSpend(c.id)}</td>
+      <td>${formatPacingColumn(c)}</td>
       <td>${summarizeSchedule(c.schedule)}</td>
-      <td><div class="actions-cell">${pauseResumeBtn}${scheduleBtn}</div></td>
+      <td><div class="actions-cell">${pauseResumeBtn}${editBtn}${scheduleBtn}</div></td>
     </tr>`;
   }).join("");
 }
@@ -862,6 +943,107 @@ async function removeSchedule(campaignId, btn) {
     await loadCampaigns();
   } catch (e) {
     showError("Failed to remove schedule: " + e.message);
+    setLoading(btn, false);
+  }
+}
+
+// ---- Analytics (async) ----
+
+async function loadAnalytics() {
+  const accountId = getAccountId();
+  if (!accountId) return;
+  try {
+    analyticsData = await apiFetch(`/api/campaigns/analytics?account_id=${accountId}`);
+    // Update spend cells in-place
+    currentCampaigns.forEach(c => {
+      const cell = document.querySelector(`td[data-spend-id="${c.id}"]`);
+      if (cell) cell.innerHTML = formatAvgSpend(c.id);
+    });
+  } catch (e) {
+    // Non-fatal — cells keep showing "..."
+  }
+}
+
+// ---- Edit Campaign Modal ----
+
+function onBidStrategyChange() {
+  const strategy = document.getElementById("editBidStrategy").value;
+  const show = strategy === "TARGET_COST" || strategy === "MANUAL_CPC";
+  document.getElementById("editBidAmountGroup").style.display = show ? "block" : "none";
+}
+
+function openEditModal(campaignId) {
+  const c = currentCampaigns.find(x => x.id === campaignId);
+  if (!c) return;
+
+  document.getElementById("editCampaignId").value = c.id;
+  document.getElementById("editCampaignLabel").value = `${c.name} (${c.id})`;
+
+  // Determine currency from budget or unitCost
+  const currency = (c.dailyBudgetRaw && c.dailyBudgetRaw.currencyCode) ||
+                   (c.unitCost && c.unitCost.currencyCode) || "USD";
+  document.getElementById("editCampaignCurrency").value = currency;
+
+  // Populate current values
+  const stratSel = document.getElementById("editBidStrategy");
+  stratSel.value = c.bidStrategy || "";
+  onBidStrategyChange();
+
+  document.getElementById("editBidAmount").value =
+    (c.unitCost && c.unitCost.amount) ? c.unitCost.amount : "";
+
+  document.getElementById("editDailyBudget").value =
+    (c.dailyBudgetRaw && c.dailyBudgetRaw.amount) ? c.dailyBudgetRaw.amount : "";
+
+  document.getElementById("editPacingStrategy").value = c.pacingStrategy || "";
+
+  document.getElementById("editCampaignModal").classList.add("active");
+}
+
+function closeEditModal() {
+  document.getElementById("editCampaignModal").classList.remove("active");
+}
+
+async function saveEditCampaign() {
+  const btn = document.getElementById("editSaveBtn");
+  setLoading(btn, true);
+
+  const campaignId = document.getElementById("editCampaignId").value;
+  const currency = document.getElementById("editCampaignCurrency").value;
+
+  const body = { account_id: getAccountId(), currency: currency };
+
+  const bidStrategy = document.getElementById("editBidStrategy").value;
+  if (bidStrategy) body.bid_strategy = bidStrategy;
+
+  const bidAmount = document.getElementById("editBidAmount").value;
+  if (bidAmount !== "") body.bid_amount = bidAmount;
+
+  const dailyBudget = document.getElementById("editDailyBudget").value;
+  if (dailyBudget !== "") body.daily_budget = dailyBudget;
+
+  const pacingStrategy = document.getElementById("editPacingStrategy").value;
+  if (pacingStrategy) body.pacing_strategy = pacingStrategy;
+
+  // Check if there's anything to update beyond account_id/currency
+  const hasUpdates = bidStrategy || bidAmount !== "" || dailyBudget !== "" || pacingStrategy;
+  if (!hasUpdates) {
+    closeEditModal();
+    setLoading(btn, false);
+    return;
+  }
+
+  try {
+    await apiFetch(`/api/campaigns/${campaignId}/update`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    closeEditModal();
+    await loadCampaigns();
+    loadAnalytics();
+  } catch (e) {
+    showError("Failed to update campaign: " + e.message);
+  } finally {
     setLoading(btn, false);
   }
 }

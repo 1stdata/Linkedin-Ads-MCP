@@ -9,7 +9,7 @@ Reuses API helpers from linkedin_ads_server.py — no duplicated logic.
 
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 
 from flask import Flask, jsonify, render_template, request, Response
@@ -40,6 +40,8 @@ linkedin_paginated_request = li.linkedin_paginated_request
 format_account_urn = li.format_account_urn
 extract_id_from_urn = li.extract_id_from_urn
 epoch_ms_to_iso = li.epoch_ms_to_iso
+iso_to_epoch_ms = li.iso_to_epoch_ms
+parse_date_params = li.parse_date_params
 get_credentials = li.get_credentials
 _load_schedules = li._load_schedules
 _save_schedules = li._save_schedules
@@ -196,13 +198,28 @@ def api_campaigns():
         cg_urn = el.get("campaignGroup", "")
         cg_id = extract_id_from_urn(cg_urn) if cg_urn else ""
 
+        # Bidding info
+        unit_cost = el.get("unitCost", {})
+        run_schedule = el.get("runSchedule", {})
+        run_schedule_iso = {}
+        if run_schedule.get("start"):
+            run_schedule_iso["start"] = epoch_ms_to_iso(run_schedule["start"])
+        if run_schedule.get("end"):
+            run_schedule_iso["end"] = epoch_ms_to_iso(run_schedule["end"])
+
         campaigns.append({
             "id": cid,
             "name": el.get("name", ""),
             "status": el.get("status", ""),
             "dailyBudget": f"{budget.get('amount', 'N/A')} {budget.get('currencyCode', '')}".strip() if budget else "N/A",
+            "dailyBudgetRaw": {"amount": budget.get("amount", ""), "currencyCode": budget.get("currencyCode", "")} if budget else None,
             "objectiveType": el.get("objectiveType", ""),
             "campaignGroup": cg_id,
+            "costType": el.get("costType", ""),
+            "bidStrategy": el.get("bidStrategy", ""),
+            "unitCost": {"amount": unit_cost.get("amount", ""), "currencyCode": unit_cost.get("currencyCode", "")} if unit_cost else None,
+            "pacingStrategy": el.get("pacingStrategy", ""),
+            "runSchedule": run_schedule_iso if run_schedule_iso else None,
             "schedule": schedule_obj,
         })
 
@@ -237,6 +254,99 @@ def api_campaign_status(campaign_id):
         return jsonify({"error": data["error"]}), 500
 
     return jsonify({"success": True, "campaign_id": campaign_id, "status": status})
+
+
+@app.route("/api/campaigns/analytics")
+@requires_auth
+def api_campaigns_analytics():
+    """Fetch 30-day average daily spend per campaign."""
+    account_id = request.args.get("account_id", LINKEDIN_BUSINESS_ACCOUNT_ID)
+    if not account_id:
+        return jsonify({"error": "No account_id provided"}), 400
+
+    today = datetime.now()
+    start_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+    end_date = today.strftime("%Y-%m-%d")
+
+    params = {
+        "q": "analytics",
+        "pivot": "CAMPAIGN",
+        "timeGranularity": "ALL",
+        "accounts": f"List({format_account_urn(account_id)})",
+    }
+    params.update(parse_date_params(start_date, end_date))
+
+    try:
+        elements = linkedin_paginated_request("/adAnalytics", params=params)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    result = {}
+    for el in elements:
+        pivot_value = el.get("pivotValue", "")
+        cid = extract_id_from_urn(pivot_value) if pivot_value else ""
+        if not cid:
+            continue
+        total_spend = float(el.get("costInLocalCurrency", 0))
+        result[cid] = {
+            "avgDailySpend": round(total_spend / 30, 2),
+            "totalSpend": round(total_spend, 2),
+            "currency": el.get("currencyCode", ""),
+        }
+
+    return jsonify(result)
+
+
+@app.route("/api/campaigns/<campaign_id>/update", methods=["POST"])
+@requires_auth
+def api_campaign_update(campaign_id):
+    """Update campaign bidding, budget, and pacing settings."""
+    payload = request.json or {}
+    account_id = payload.get("account_id", LINKEDIN_BUSINESS_ACCOUNT_ID)
+    if not account_id:
+        return jsonify({"error": "No account_id provided"}), 400
+
+    patch_set = {}
+
+    bid_strategy = payload.get("bid_strategy")
+    if bid_strategy:
+        patch_set["bidStrategy"] = bid_strategy.upper()
+
+    bid_amount = payload.get("bid_amount")
+    bid_currency = payload.get("currency", "USD")
+    if bid_amount is not None and bid_amount != "":
+        patch_set["unitCost"] = {
+            "amount": bid_amount,
+            "currencyCode": bid_currency,
+        }
+
+    daily_budget = payload.get("daily_budget")
+    if daily_budget is not None and daily_budget != "":
+        patch_set["dailyBudget"] = {
+            "amount": daily_budget,
+            "currencyCode": bid_currency,
+        }
+
+    pacing_strategy = payload.get("pacing_strategy")
+    if pacing_strategy:
+        patch_set["pacingStrategy"] = pacing_strategy.upper()
+
+    if not patch_set:
+        return jsonify({"error": "No fields to update"}), 400
+
+    body = {"patch": {"$set": patch_set}}
+    extra_headers = {"X-RestLi-Method": "PARTIAL_UPDATE"}
+    data = linkedin_api_request(
+        "POST",
+        f"/adAccounts/{account_id}/adCampaigns/{campaign_id}",
+        json_body=body,
+        extra_headers=extra_headers,
+    )
+
+    if "error" in data:
+        return jsonify({"error": data["error"]}), 500
+
+    return jsonify({"success": True, "campaign_id": campaign_id, "updated": list(patch_set.keys())})
 
 
 @app.route("/api/schedules")
