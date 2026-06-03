@@ -512,6 +512,7 @@ def api_run_scheduler():
             })
 
     _scheduler_state["last_run"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    _record_run("manual", actions)
 
     return jsonify({
         "message": f"Processed {len(rules)} rule(s).",
@@ -535,6 +536,47 @@ _scheduler_state = {
     "interval_minutes": SCHEDULER_INTERVAL // 60,
 }
 
+MAX_HISTORY = 50
+HISTORY_FILE = os.path.join(
+    "/data" if os.environ.get("RAILWAY_ENVIRONMENT") else os.path.dirname(os.path.abspath(__file__)),
+    "scheduler_history.json",
+)
+
+
+def _load_history():
+    """Load run history from disk."""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return []
+
+
+def _save_history(history):
+    """Persist run history to disk (capped at MAX_HISTORY)."""
+    history = history[-MAX_HISTORY:]
+    try:
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=2)
+    except IOError as e:
+        logger.warning("Could not save history: %s", e)
+
+
+def _record_run(trigger, actions):
+    """Append a run entry to history."""
+    entry = {
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "trigger": trigger,
+        "rules_processed": len(actions),
+        "actions": actions,
+    }
+    history = _load_history()
+    history.append(entry)
+    _save_history(history)
+    return entry
+
 
 @app.route("/api/scheduler/status")
 @requires_auth
@@ -543,7 +585,16 @@ def api_scheduler_status():
     return jsonify(_scheduler_state)
 
 
-def _run_scheduler_tick():
+@app.route("/api/scheduler/history")
+@requires_auth
+def api_scheduler_history():
+    """Return scheduler run history (most recent first)."""
+    history = _load_history()
+    history.reverse()
+    return jsonify(history)
+
+
+def _run_scheduler_tick(trigger="auto"):
     """Execute one scheduler pass — evaluate all rules and pause/resume."""
     try:
         from zoneinfo import ZoneInfo
@@ -553,9 +604,11 @@ def _run_scheduler_tick():
     schedules = _load_schedules()
     rules = schedules.get("weekday_only", [])
     if not rules:
+        _record_run(trigger, [])
         return
 
     DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    actions = []
 
     for rule in rules:
         account_id = rule["account_id"]
@@ -567,6 +620,7 @@ def _run_scheduler_tick():
             tz = ZoneInfo(tz_name)
         except Exception:
             logger.warning("Invalid timezone '%s' for campaign %s", tz_name, campaign_id)
+            actions.append({"campaign_name": campaign_name, "action": "SKIP", "reason": f"Invalid timezone '{tz_name}'"})
             continue
 
         now = datetime.now(tz)
@@ -600,8 +654,12 @@ def _run_scheduler_tick():
 
         if "error" in data:
             logger.error("Failed %s for %s (%s): %s", desired, campaign_name, campaign_id, data["error"])
+            actions.append({"campaign_name": campaign_name, "action": "ERROR", "reason": str(data["error"])})
         else:
             logger.info("%s -> %s (%s) [%s %s, tz=%s]", desired, campaign_name, campaign_id, now.strftime("%A"), current_time, tz_name)
+            actions.append({"campaign_name": campaign_name, "action": desired, "day": now.strftime("%A"), "time": current_time, "timezone": tz_name})
+
+    _record_run(trigger, actions)
 
 
 def _update_next_run():

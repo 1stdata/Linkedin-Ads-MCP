@@ -360,6 +360,13 @@
         <span id="schedulerStatus" class="schedule-info" style="font-size:13px"></span>
       </div>
       <div id="schedulerResults" class="scheduler-results" style="display:none"></div>
+      <div style="margin-top:16px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <span style="font-size:13px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em">Run History</span>
+          <button class="btn btn-sm btn-outline" onclick="loadSchedulerHistory()">Refresh</button>
+        </div>
+        <div id="schedulerHistory" style="font-size:13px;max-height:300px;overflow-y:auto;color:var(--text-muted)">Loading...</div>
+      </div>
     </div>
   </div>
 </div>
@@ -1076,6 +1083,40 @@ async function loadSchedulerStatus() {
   } catch (e) { /* non-fatal */ }
 }
 
+async function loadSchedulerHistory() {
+  const el = document.getElementById("schedulerHistory");
+  try {
+    const history = await apiFetch("/api/scheduler/history");
+    if (!history.length) {
+      el.innerHTML = '<span style="color:var(--text-muted)">No runs recorded yet.</span>';
+      return;
+    }
+    el.innerHTML = history.map(entry => {
+      const time = utcToEastern(entry.timestamp);
+      const trigger = entry.trigger === "manual"
+        ? '<span class="badge badge-paused">MANUAL</span>'
+        : '<span class="badge badge-active">AUTO</span>';
+      const actionSummary = entry.actions.length
+        ? entry.actions.map(a => {
+            let badge = "";
+            if (a.action === "ACTIVE") badge = '<span class="badge badge-active">ACTIVE</span>';
+            else if (a.action === "PAUSED") badge = '<span class="badge badge-paused">PAUSED</span>';
+            else if (a.action === "ERROR") badge = '<span class="badge badge-draft">ERROR</span>';
+            else badge = '<span class="badge badge-draft">SKIP</span>';
+            const detail = a.reason ? ` — ${esc(a.reason).substring(0, 80)}` : "";
+            return `<div style="margin-left:16px">${badge} ${esc(a.campaign_name)}${detail}</div>`;
+          }).join("")
+        : '<div style="margin-left:16px;color:var(--text-muted)">No rules configured</div>';
+      return `<div style="padding:8px 0;border-bottom:1px solid var(--border)">
+        <div>${trigger} <strong>${time}</strong> — ${entry.rules_processed} rule(s)</div>
+        ${actionSummary}
+      </div>`;
+    }).join("");
+  } catch (e) {
+    el.innerHTML = '<span style="color:var(--text-muted)">Could not load history.</span>';
+  }
+}
+
 async function runScheduler() {
   const btn = document.getElementById("runSchedulerBtn");
   const results = document.getElementById("schedulerResults");
@@ -1104,6 +1145,7 @@ async function runScheduler() {
     results.innerHTML += `<div style="margin-top:8px;color:var(--text-muted);font-size:12px">${esc(data.message)}</div>`;
     await loadCampaigns();
     loadSchedulerStatus();
+    loadSchedulerHistory();
   } catch (e) {
     showError("Scheduler error: " + e.message);
   } finally {
@@ -1117,6 +1159,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   loadCampaignGroups();
   loadCampaigns();
   loadSchedulerStatus();
+  loadSchedulerHistory();
 });
 </script>
 </body>
