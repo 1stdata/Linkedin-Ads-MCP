@@ -94,17 +94,20 @@ def api_accounts():
     try:
         elements = linkedin_paginated_request(
             "/adAccounts",
-            params={"q": "search", "search": "(status:(values:List(ACTIVE,DRAFT,CANCELED)))"},
+            params={"q": "search"},
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
     accounts = []
     for el in elements:
+        status = el.get("status", "")
+        if status in ("REMOVED",):
+            continue
         accounts.append({
             "id": extract_id_from_urn(el.get("id", el.get("reference", ""))),
             "name": el.get("name", ""),
-            "status": el.get("status", ""),
+            "status": status,
             "currency": el.get("currency", ""),
         })
 
