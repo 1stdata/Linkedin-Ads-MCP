@@ -511,6 +511,8 @@ def api_run_scheduler():
                 "timezone": tz_name,
             })
 
+    _scheduler_state["last_run"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
     return jsonify({
         "message": f"Processed {len(rules)} rule(s).",
         "actions": actions,
@@ -525,6 +527,20 @@ SCHEDULER_INTERVAL = int(os.environ.get("SCHEDULER_INTERVAL_MINUTES", 30)) * 60
 
 logger = logging.getLogger("scheduler")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
+
+# Scheduler state — accessible via /api/scheduler/status
+_scheduler_state = {
+    "last_run": None,
+    "next_run": None,
+    "interval_minutes": SCHEDULER_INTERVAL // 60,
+}
+
+
+@app.route("/api/scheduler/status")
+@requires_auth
+def api_scheduler_status():
+    """Return scheduler timing info."""
+    return jsonify(_scheduler_state)
 
 
 def _run_scheduler_tick():
@@ -588,17 +604,28 @@ def _run_scheduler_tick():
             logger.info("%s -> %s (%s) [%s %s, tz=%s]", desired, campaign_name, campaign_id, now.strftime("%A"), current_time, tz_name)
 
 
+def _update_next_run():
+    """Set the next_run timestamp."""
+    _scheduler_state["next_run"] = (
+        datetime.utcnow() + timedelta(seconds=SCHEDULER_INTERVAL)
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 def _scheduler_loop():
     """Background loop that runs the scheduler every SCHEDULER_INTERVAL seconds."""
     logger.info("Background scheduler started (interval=%d min)", SCHEDULER_INTERVAL // 60)
+    _update_next_run()
     while True:
         time.sleep(SCHEDULER_INTERVAL)
         try:
             logger.info("Scheduler tick starting...")
+            _scheduler_state["last_run"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
             _run_scheduler_tick()
+            _update_next_run()
             logger.info("Scheduler tick complete.")
         except Exception as e:
             logger.exception("Scheduler tick failed: %s", e)
+            _update_next_run()
 
 
 def start_background_scheduler():

@@ -355,7 +355,10 @@
   <div class="section">
     <div class="section-title">Scheduler</div>
     <div class="scheduler-panel">
-      <button class="btn btn-primary" id="runSchedulerBtn" onclick="runScheduler()">Run Scheduler Now</button>
+      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:12px">
+        <button class="btn btn-primary" id="runSchedulerBtn" onclick="runScheduler()">Run Scheduler Now</button>
+        <span id="schedulerStatus" class="schedule-info" style="font-size:13px"></span>
+      </div>
       <div id="schedulerResults" class="scheduler-results" style="display:none"></div>
     </div>
   </div>
@@ -1050,6 +1053,18 @@ async function saveEditCampaign() {
 
 // ---- Scheduler ----
 
+async function loadSchedulerStatus() {
+  try {
+    const s = await apiFetch("/api/scheduler/status");
+    const el = document.getElementById("schedulerStatus");
+    const parts = [];
+    if (s.last_run) parts.push(`Last run: ${s.last_run}`);
+    if (s.next_run) parts.push(`Next auto-run: ${s.next_run}`);
+    parts.push(`Interval: ${s.interval_minutes} min`);
+    el.textContent = parts.join("  |  ");
+  } catch (e) { /* non-fatal */ }
+}
+
 async function runScheduler() {
   const btn = document.getElementById("runSchedulerBtn");
   const results = document.getElementById("schedulerResults");
@@ -1077,6 +1092,7 @@ async function runScheduler() {
     }
     results.innerHTML += `<div style="margin-top:8px;color:var(--text-muted);font-size:12px">${esc(data.message)}</div>`;
     await loadCampaigns();
+    loadSchedulerStatus();
   } catch (e) {
     showError("Scheduler error: " + e.message);
   } finally {
@@ -1089,6 +1105,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   await loadAccounts();
   loadCampaignGroups();
   loadCampaigns();
+  loadSchedulerStatus();
 });
 </script>
 </body>
