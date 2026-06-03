@@ -40,8 +40,6 @@ linkedin_paginated_request = li.linkedin_paginated_request
 format_account_urn = li.format_account_urn
 extract_id_from_urn = li.extract_id_from_urn
 epoch_ms_to_iso = li.epoch_ms_to_iso
-iso_to_epoch_ms = li.iso_to_epoch_ms
-parse_date_params = li.parse_date_params
 get_credentials = li.get_credentials
 _load_schedules = li._load_schedules
 _save_schedules = li._save_schedules
@@ -265,25 +263,36 @@ def api_campaigns_analytics():
         return jsonify({"error": "No account_id provided"}), 400
 
     today = datetime.now()
-    start_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
-    end_date = today.strftime("%Y-%m-%d")
+    start = today - timedelta(days=30)
 
-    params = {
-        "q": "analytics",
-        "pivot": "CAMPAIGN",
-        "timeGranularity": "ALL",
-        "accounts": f"List({format_account_urn(account_id)})",
-    }
-    params.update(parse_date_params(start_date, end_date))
+    date_range = (
+        f"(start:(year:{start.year},month:{start.month},day:{start.day}),"
+        f"end:(year:{today.year},month:{today.month},day:{today.day}))"
+    )
+    # Build URL manually — LinkedIn requires RestLi syntax chars unencoded
+    # but URN colons must be percent-encoded
+    encoded_urn = f"urn%3Ali%3AsponsoredAccount%3A{account_id}"
+    qs = (
+        f"q=analytics&pivot=CAMPAIGN&timeGranularity=ALL"
+        f"&accounts=List({encoded_urn})"
+        f"&dateRange={date_range}"
+        f"&fields=costInLocalCurrency,pivotValues,dateRange"
+    )
+    full_url = f"https://api.linkedin.com/rest/adAnalytics?{qs}"
 
     try:
-        elements = linkedin_paginated_request("/adAnalytics", params=params)
+        data = linkedin_api_request("GET", full_url)
+        if "error" in data:
+            raise RuntimeError(data["error"])
+        elements = data.get("elements", [])
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
     result = {}
     for el in elements:
-        pivot_value = el.get("pivotValue", "")
+        # API returns pivotValues (array) or pivotValue (string)
+        pivot_values = el.get("pivotValues", [])
+        pivot_value = pivot_values[0] if pivot_values else el.get("pivotValue", "")
         cid = extract_id_from_urn(pivot_value) if pivot_value else ""
         if not cid:
             continue
@@ -291,7 +300,6 @@ def api_campaigns_analytics():
         result[cid] = {
             "avgDailySpend": round(total_spend / 30, 2),
             "totalSpend": round(total_spend, 2),
-            "currency": el.get("currencyCode", ""),
         }
 
     return jsonify(result)
