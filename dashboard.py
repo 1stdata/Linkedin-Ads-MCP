@@ -123,26 +123,23 @@ def api_campaigns():
     if not account_id:
         return jsonify({"error": "No account_id provided and LINKEDIN_BUSINESS_ACCOUNT_ID not set"}), 400
 
-    # Build search criteria
-    search_parts = [f"account:(values:List(urn:li:sponsoredAccount:{account_id}))"]
-
     filter_status = request.args.get("status")
-    if filter_status:
-        search_parts.append(f"status:(values:List({filter_status}))")
-
     filter_group = request.args.get("campaign_group_id")
-    if filter_group:
-        search_parts.append(f"campaignGroup:(values:List(urn:li:sponsoredCampaignGroup:{filter_group}))")
-
-    search_param = ",".join(search_parts)
 
     try:
         elements = linkedin_paginated_request(
             f"/adAccounts/{account_id}/adCampaigns",
-            params={"q": "search", "search": f"({search_param})"},
+            params={"q": "search"},
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+    # Apply client-side filters
+    if filter_status:
+        elements = [el for el in elements if el.get("status") == filter_status]
+    if filter_group:
+        target_group_urn = f"urn:li:sponsoredCampaignGroup:{filter_group}"
+        elements = [el for el in elements if el.get("campaignGroup") == target_group_urn]
 
     # Load schedules to cross-reference
     schedules = _load_schedules()
