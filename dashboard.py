@@ -87,6 +87,30 @@ def index():
     return render_template("dashboard.html")
 
 
+@app.route("/api/accounts")
+@requires_auth
+def api_accounts():
+    """List all accessible LinkedIn Ad Accounts."""
+    try:
+        elements = linkedin_paginated_request(
+            "/adAccounts",
+            params={"q": "search", "search": "(status:(values:List(ACTIVE,DRAFT,CANCELED)))"},
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    accounts = []
+    for el in elements:
+        accounts.append({
+            "id": extract_id_from_urn(el.get("id", el.get("reference", ""))),
+            "name": el.get("name", ""),
+            "status": el.get("status", ""),
+            "currency": el.get("currency", ""),
+        })
+
+    return jsonify({"accounts": accounts, "default": LINKEDIN_BUSINESS_ACCOUNT_ID})
+
+
 @app.route("/api/campaign-groups")
 @requires_auth
 def api_campaign_groups():

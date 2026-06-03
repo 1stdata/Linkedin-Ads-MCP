@@ -299,7 +299,12 @@
 <div class="header">
   <div>
     <h1>LinkedIn Ads Scheduler</h1>
-    <div class="header-info">Account: <span id="accountId">—</span></div>
+    <div class="header-info" style="display:flex;align-items:center;gap:8px;">
+      Account:
+      <select id="accountSelect" onchange="onAccountChange()" style="padding:4px 8px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px;">
+        <option value="">Loading...</option>
+      </select>
+    </div>
   </div>
   <button class="btn btn-outline" onclick="loadCampaigns()">Refresh</button>
 </div>
@@ -410,6 +415,10 @@ let gridHours = { sun:[], mon:[], tue:[], wed:[], thu:[], fri:[], sat:[] };
 let isDragging = false;
 let dragActivate = true;
 
+function getAccountId() {
+  return document.getElementById("accountSelect").value;
+}
+
 function showError(msg) {
   const el = document.getElementById("errorBanner");
   el.textContent = msg;
@@ -447,11 +456,43 @@ async function apiFetch(url, opts = {}) {
   return data;
 }
 
+// ---- Accounts ----
+
+async function loadAccounts() {
+  const sel = document.getElementById("accountSelect");
+  try {
+    const data = await apiFetch("/api/accounts");
+    sel.innerHTML = "";
+    (data.accounts || []).forEach(a => {
+      const opt = document.createElement("option");
+      opt.value = a.id;
+      opt.textContent = `${a.name} (${a.id})`;
+      sel.appendChild(opt);
+    });
+    // Select the default account
+    if (data.default && sel.querySelector(`option[value="${data.default}"]`)) {
+      sel.value = data.default;
+    }
+  } catch (e) {
+    sel.innerHTML = '<option value="">Error loading accounts</option>';
+  }
+}
+
+function onAccountChange() {
+  // Reset group filter since groups are per-account
+  document.getElementById("filterGroup").innerHTML = '<option value="">All Groups</option>';
+  campaignGroups = {};
+  loadCampaignGroups();
+  loadCampaigns();
+}
+
 // ---- Campaign Groups ----
 
 async function loadCampaignGroups() {
+  const accountId = getAccountId();
+  if (!accountId) return;
   try {
-    const data = await apiFetch("/api/campaign-groups");
+    const data = await apiFetch(`/api/campaign-groups?account_id=${accountId}`);
     const sel = document.getElementById("filterGroup");
     const current = sel.value;
     sel.innerHTML = '<option value="">All Groups</option>';
@@ -474,16 +515,22 @@ async function loadCampaigns() {
   const tbody = document.getElementById("campaignTableBody");
   tbody.innerHTML = '<tr><td colspan="7" class="empty-state">Loading campaigns...</td></tr>';
 
+  const accountId = getAccountId();
+  if (!accountId) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">Select an account above.</td></tr>';
+    return;
+  }
+
   const params = new URLSearchParams();
+  params.set("account_id", accountId);
   const groupId = document.getElementById("filterGroup").value;
   const statusVal = document.getElementById("filterStatus").value;
   if (groupId) params.set("campaign_group_id", groupId);
   if (statusVal) params.set("status", statusVal);
-  const qs = params.toString() ? "?" + params.toString() : "";
+  const qs = "?" + params.toString();
 
   try {
     const data = await apiFetch("/api/campaigns" + qs);
-    document.getElementById("accountId").textContent = data.account_id || "—";
     currentCampaigns = data.campaigns || [];
     renderCampaigns();
   } catch (e) {
@@ -587,7 +634,7 @@ async function toggleStatus(campaignId, newStatus, btn) {
   try {
     await apiFetch(`/api/campaigns/${campaignId}/status`, {
       method: "POST",
-      body: JSON.stringify({ status: newStatus }),
+      body: JSON.stringify({ account_id: getAccountId(), status: newStatus }),
     });
     await loadCampaigns();
   } catch (e) {
@@ -792,6 +839,7 @@ async function saveSchedule() {
     await apiFetch("/api/schedules", {
       method: "POST",
       body: JSON.stringify({
+        account_id: getAccountId(),
         campaign_id: campaignId,
         campaign_name: campaignName,
         timezone: timezone,
@@ -810,7 +858,7 @@ async function saveSchedule() {
 async function removeSchedule(campaignId, btn) {
   setLoading(btn, true);
   try {
-    await apiFetch(`/api/schedules/${campaignId}`, { method: "DELETE" });
+    await apiFetch(`/api/schedules/${campaignId}?account_id=${getAccountId()}`, { method: "DELETE" });
     await loadCampaigns();
   } catch (e) {
     showError("Failed to remove schedule: " + e.message);
@@ -855,7 +903,8 @@ async function runScheduler() {
 }
 
 // ---- Init ----
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
+  await loadAccounts();
   loadCampaignGroups();
   loadCampaigns();
 });
