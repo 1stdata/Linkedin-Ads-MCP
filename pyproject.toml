@@ -1,0 +1,32 @@
+[project]
+name = "mcp-linkedin-ads"
+version = "0.1.0"
+description = "LinkedIn Ads API integration for Model Context Protocol (MCP)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Artur MacLellan"}
+]
+keywords = ["mcp", "linkedin ads", "advertising", "marketing", "claude"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules"
+]
+dependencies = [
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
+    "mcp[cli]>=1.3.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["linkedin_ads_server"]

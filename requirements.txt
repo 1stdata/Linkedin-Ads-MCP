@@ -1,0 +1,8 @@
+# MCP requirements
+mcp[cli]>=1.3.0
+
+# HTTP client
+requests>=2.31.0
+
+# Environment configuration
+python-dotenv>=1.0.0
