@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import unittest
+from datetime import datetime as real_datetime
 from unittest.mock import patch, MagicMock
 
 # Ensure env vars are set for import (tests mock actual API calls)
@@ -265,6 +266,7 @@ class TestCreateCampaign(unittest.TestCase):
             daily_budget_amount="50.00",
             daily_budget_currency="USD",
             cost_type="CPM",
+            bid_strategy="",
             bid_amount="",
             status="DRAFT",
             start_date="",
@@ -285,7 +287,7 @@ class TestUpdateCampaign(unittest.TestCase):
         result = run_async(server.update_campaign(
             account_id="511389977", campaign_id="50", name="Updated Name",
             status="", daily_budget_amount="", daily_budget_currency="USD",
-            bid_amount="", start_date="", end_date="", pacing_strategy=""))
+            bid_strategy="", bid_amount="", start_date="", end_date="", pacing_strategy=""))
         self.assertIn("updated successfully", result)
 
 
@@ -810,6 +812,292 @@ class TestPrompts(unittest.TestCase):
         content = server.linkedin_ads_campaign_creation_help()
         self.assertIn("Create a Campaign Group", content)
         self.assertIn("WEBSITE_VISITS", content)
+
+
+# ---------------------------------------------------------------------------
+# New tools: Bid Strategy, Weekday Scheduling
+# ---------------------------------------------------------------------------
+
+class TestSetBidStrategy(unittest.TestCase):
+
+    @patch("linkedin_ads_server.linkedin_api_request")
+    def test_set_bid_strategy_success(self, mock_req):
+        mock_req.return_value = {"status_code": 204, "success": True}
+        result = run_async(server.set_bid_strategy(
+            account_id="511389977", campaign_id="50",
+            bid_strategy="TARGET_COST", bid_amount="5.00", bid_currency="USD"))
+        self.assertIn("bid strategy updated successfully", result)
+        self.assertIn("TARGET_COST", result)
+        self.assertIn("5.00", result)
+
+    @patch("linkedin_ads_server.linkedin_api_request")
+    def test_set_bid_strategy_no_amount(self, mock_req):
+        mock_req.return_value = {"status_code": 204, "success": True}
+        result = run_async(server.set_bid_strategy(
+            account_id="511389977", campaign_id="50",
+            bid_strategy="MAXIMUM_DELIVERY", bid_amount="", bid_currency="USD"))
+        self.assertIn("MAXIMUM_DELIVERY", result)
+        self.assertNotIn("Bid Amount", result)
+
+    def test_set_bid_strategy_invalid(self):
+        result = run_async(server.set_bid_strategy(
+            account_id="511389977", campaign_id="50",
+            bid_strategy="INVALID", bid_amount="", bid_currency="USD"))
+        self.assertIn("Invalid bid strategy", result)
+
+    @patch("linkedin_ads_server.linkedin_api_request")
+    def test_set_bid_strategy_api_error(self, mock_req):
+        mock_req.return_value = {"error": "Unauthorized", "status_code": 401}
+        result = run_async(server.set_bid_strategy(
+            account_id="511389977", campaign_id="50",
+            bid_strategy="MANUAL_CPC", bid_amount="3.00", bid_currency="USD"))
+        self.assertIn("Error setting bid strategy", result)
+
+
+class TestCreateCampaignWithBidStrategy(unittest.TestCase):
+
+    @patch("linkedin_ads_server.linkedin_api_request")
+    def test_create_campaign_with_bid_strategy(self, mock_req):
+        mock_req.return_value = {"_created_id": "400", "status_code": 201}
+        result = run_async(server.create_campaign(
+            account_id="511389977",
+            name="Strategy Campaign",
+            campaign_group_id="100",
+            objective_type="WEBSITE_VISITS",
+            campaign_type="SPONSORED_UPDATES",
+            daily_budget_amount="50.00",
+            daily_budget_currency="USD",
+            cost_type="CPM",
+            bid_strategy="MAXIMUM_DELIVERY",
+            bid_amount="",
+            status="DRAFT",
+            start_date="",
+            end_date="",
+            pacing_strategy="",
+            locale_country="US",
+            locale_language="en",
+        ))
+        self.assertIn("created successfully", result)
+        # Verify bidStrategy was in the API call body
+        call_args = mock_req.call_args
+        body = call_args[1].get("json_body") or call_args[0][2] if len(call_args[0]) > 2 else call_args[1].get("json_body")
+        self.assertEqual(body["bidStrategy"], "MAXIMUM_DELIVERY")
+
+
+class TestUpdateCampaignWithBidStrategy(unittest.TestCase):
+
+    @patch("linkedin_ads_server.linkedin_api_request")
+    def test_update_campaign_with_bid_strategy(self, mock_req):
+        mock_req.return_value = {"status_code": 204, "success": True}
+        result = run_async(server.update_campaign(
+            account_id="511389977", campaign_id="50", name="",
+            status="", daily_budget_amount="", daily_budget_currency="USD",
+            bid_strategy="TARGET_COST", bid_amount="7.00",
+            start_date="", end_date="", pacing_strategy=""))
+        self.assertIn("updated successfully", result)
+        self.assertIn("bidStrategy", result)
+
+
+class TestAddWeekdaySchedule(unittest.TestCase):
+
+    def setUp(self):
+        """Ensure clean state by removing schedules.json if present."""
+        self._original_file = server.SCHEDULES_FILE
+        self._test_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_schedules.json")
+        server.SCHEDULES_FILE = self._test_file
+        if os.path.exists(self._test_file):
+            os.remove(self._test_file)
+
+    def tearDown(self):
+        server.SCHEDULES_FILE = self._original_file
+        if os.path.exists(self._test_file):
+            os.remove(self._test_file)
+
+    def test_add_weekday_schedule(self):
+        result = run_async(server.add_weekday_schedule(
+            account_id="511389977", campaign_id="12345",
+            campaign_name="Summer Campaign", timezone="America/New_York",
+            resume_time="06:00", pause_time="18:00"))
+        self.assertIn("added to weekday-only schedule", result)
+        self.assertIn("Monday at 06:00", result)
+        self.assertIn("Friday at 18:00", result)
+
+        # Verify file was created
+        with open(self._test_file) as f:
+            data = json.load(f)
+        self.assertEqual(len(data["weekday_only"]), 1)
+        self.assertEqual(data["weekday_only"][0]["campaign_id"], "12345")
+
+    def test_add_duplicate(self):
+        run_async(server.add_weekday_schedule(
+            account_id="511389977", campaign_id="12345",
+            campaign_name="Summer Campaign", timezone="America/New_York",
+            resume_time="06:00", pause_time="18:00"))
+        result = run_async(server.add_weekday_schedule(
+            account_id="511389977", campaign_id="12345",
+            campaign_name="Summer Campaign", timezone="America/New_York",
+            resume_time="06:00", pause_time="18:00"))
+        self.assertIn("already scheduled", result)
+
+
+class TestRemoveWeekdaySchedule(unittest.TestCase):
+
+    def setUp(self):
+        self._original_file = server.SCHEDULES_FILE
+        self._test_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_schedules.json")
+        server.SCHEDULES_FILE = self._test_file
+        # Pre-populate
+        data = {"weekday_only": [{
+            "account_id": "511389977",
+            "campaign_id": "12345",
+            "campaign_name": "Test",
+            "timezone": "UTC",
+            "resume_time": "06:00",
+            "pause_time": "18:00",
+            "added_at": "2025-06-01T00:00:00",
+        }]}
+        with open(self._test_file, "w") as f:
+            json.dump(data, f)
+
+    def tearDown(self):
+        server.SCHEDULES_FILE = self._original_file
+        if os.path.exists(self._test_file):
+            os.remove(self._test_file)
+
+    def test_remove_existing(self):
+        result = run_async(server.remove_weekday_schedule(
+            account_id="511389977", campaign_id="12345"))
+        self.assertIn("removed from weekday-only scheduling", result)
+
+        with open(self._test_file) as f:
+            data = json.load(f)
+        self.assertEqual(len(data["weekday_only"]), 0)
+
+    def test_remove_nonexistent(self):
+        result = run_async(server.remove_weekday_schedule(
+            account_id="511389977", campaign_id="99999"))
+        self.assertIn("not found", result)
+
+
+class TestListWeekdaySchedules(unittest.TestCase):
+
+    def setUp(self):
+        self._original_file = server.SCHEDULES_FILE
+        self._test_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_schedules.json")
+        server.SCHEDULES_FILE = self._test_file
+
+    def tearDown(self):
+        server.SCHEDULES_FILE = self._original_file
+        if os.path.exists(self._test_file):
+            os.remove(self._test_file)
+
+    def test_list_empty(self):
+        if os.path.exists(self._test_file):
+            os.remove(self._test_file)
+        result = run_async(server.list_weekday_schedules(format="table"))
+        self.assertIn("No weekday-only schedules", result)
+
+    def test_list_with_rules(self):
+        data = {"weekday_only": [
+            {"account_id": "511389977", "campaign_id": "12345",
+             "campaign_name": "Summer Campaign", "timezone": "America/New_York",
+             "resume_time": "06:00", "pause_time": "18:00", "added_at": "2025-06-01T00:00:00"},
+            {"account_id": "511389977", "campaign_id": "67890",
+             "campaign_name": "Winter Campaign", "timezone": "UTC",
+             "resume_time": "07:00", "pause_time": "17:00", "added_at": "2025-06-02T00:00:00"},
+        ]}
+        with open(self._test_file, "w") as f:
+            json.dump(data, f)
+
+        result = run_async(server.list_weekday_schedules(format="table"))
+        self.assertIn("12345", result)
+        self.assertIn("67890", result)
+        self.assertIn("Summer Campaign", result)
+        self.assertIn("Winter Campaign", result)
+
+
+class TestRunWeekdayScheduler(unittest.TestCase):
+
+    def setUp(self):
+        self._original_file = server.SCHEDULES_FILE
+        self._test_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_schedules.json")
+        server.SCHEDULES_FILE = self._test_file
+
+    def tearDown(self):
+        server.SCHEDULES_FILE = self._original_file
+        if os.path.exists(self._test_file):
+            os.remove(self._test_file)
+
+    def test_no_rules(self):
+        if os.path.exists(self._test_file):
+            os.remove(self._test_file)
+        result = run_async(server.run_weekday_scheduler())
+        self.assertIn("No weekday-only schedules", result)
+
+    @patch("linkedin_ads_server.linkedin_api_request")
+    @patch("linkedin_ads_server.datetime")
+    def test_weekday_resumes(self, mock_dt, mock_req):
+        """On a Tuesday, campaigns should be set to ACTIVE."""
+        from zoneinfo import ZoneInfo
+        mock_dt.now.return_value = real_datetime(2025, 6, 3, 10, 0, tzinfo=ZoneInfo("UTC"))  # Tuesday
+        mock_dt.side_effect = lambda *a, **kw: real_datetime(*a, **kw)
+        mock_req.return_value = {"status_code": 204, "success": True}
+
+        data = {"weekday_only": [{
+            "account_id": "511389977", "campaign_id": "12345",
+            "campaign_name": "Test", "timezone": "UTC",
+            "resume_time": "06:00", "pause_time": "18:00",
+            "added_at": "2025-06-01T00:00:00",
+        }]}
+        with open(self._test_file, "w") as f:
+            json.dump(data, f)
+
+        result = run_async(server.run_weekday_scheduler())
+        self.assertIn("ACTIVE", result)
+        self.assertIn("Processed 1 rule(s)", result)
+
+    @patch("linkedin_ads_server.linkedin_api_request")
+    @patch("linkedin_ads_server.datetime")
+    def test_weekend_pauses(self, mock_dt, mock_req):
+        """On a Saturday, campaigns should be set to PAUSED."""
+        from zoneinfo import ZoneInfo
+        mock_dt.now.return_value = real_datetime(2025, 6, 7, 10, 0, tzinfo=ZoneInfo("UTC"))  # Saturday
+        mock_dt.side_effect = lambda *a, **kw: real_datetime(*a, **kw)
+        mock_req.return_value = {"status_code": 204, "success": True}
+
+        data = {"weekday_only": [{
+            "account_id": "511389977", "campaign_id": "12345",
+            "campaign_name": "Test", "timezone": "UTC",
+            "resume_time": "06:00", "pause_time": "18:00",
+            "added_at": "2025-06-01T00:00:00",
+        }]}
+        with open(self._test_file, "w") as f:
+            json.dump(data, f)
+
+        result = run_async(server.run_weekday_scheduler())
+        self.assertIn("PAUSED", result)
+        self.assertIn("Processed 1 rule(s)", result)
+
+    @patch("linkedin_ads_server.linkedin_api_request")
+    @patch("linkedin_ads_server.datetime")
+    def test_friday_evening_pauses(self, mock_dt, mock_req):
+        """On Friday at 19:00, campaigns should be set to PAUSED."""
+        from zoneinfo import ZoneInfo
+        mock_dt.now.return_value = real_datetime(2025, 6, 6, 19, 0, tzinfo=ZoneInfo("UTC"))  # Friday 19:00
+        mock_dt.side_effect = lambda *a, **kw: real_datetime(*a, **kw)
+        mock_req.return_value = {"status_code": 204, "success": True}
+
+        data = {"weekday_only": [{
+            "account_id": "511389977", "campaign_id": "12345",
+            "campaign_name": "Test", "timezone": "UTC",
+            "resume_time": "06:00", "pause_time": "18:00",
+            "added_at": "2025-06-01T00:00:00",
+        }]}
+        with open(self._test_file, "w") as f:
+            json.dump(data, f)
+
+        result = run_async(server.run_weekday_scheduler())
+        self.assertIn("PAUSED", result)
 
 
 if __name__ == "__main__":

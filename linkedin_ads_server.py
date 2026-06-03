@@ -748,6 +748,7 @@ async def create_campaign(
     daily_budget_amount: str = Field(description="Daily budget amount (e.g. '50.00')"),
     daily_budget_currency: str = Field(default="USD", description="Currency code"),
     cost_type: str = Field(default="CPM", description="Cost type: CPC, CPM, CPV"),
+    bid_strategy: str = Field(default="", description="Bid strategy: MAXIMUM_DELIVERY, TARGET_COST, or MANUAL_CPC (leave empty for default)"),
     bid_amount: str = Field(default="", description="Bid amount (e.g. '5.00'). Leave empty for auto-bid."),
     status: str = Field(default="DRAFT", description="Initial status: ACTIVE, PAUSED, DRAFT"),
     start_date: str = Field(default="", description="Start date YYYY-MM-DD (leave empty for immediate)"),
@@ -768,6 +769,7 @@ async def create_campaign(
         daily_budget_amount: Daily budget amount.
         daily_budget_currency: Currency code.
         cost_type: Cost/bid type.
+        bid_strategy: Optional bid strategy (MAXIMUM_DELIVERY, TARGET_COST, MANUAL_CPC).
         bid_amount: Optional bid amount.
         status: Initial status.
         start_date: Optional start date.
@@ -794,6 +796,9 @@ async def create_campaign(
                 "currencyCode": daily_budget_currency,
             },
         }
+
+        if bid_strategy:
+            body["bidStrategy"] = bid_strategy.upper()
 
         if bid_amount:
             body["unitCost"] = {
@@ -837,6 +842,7 @@ async def update_campaign(
     status: str = Field(default="", description="New status: ACTIVE, PAUSED, ARCHIVED, CANCELED"),
     daily_budget_amount: str = Field(default="", description="New daily budget amount"),
     daily_budget_currency: str = Field(default="USD", description="Currency code"),
+    bid_strategy: str = Field(default="", description="New bid strategy: MAXIMUM_DELIVERY, TARGET_COST, or MANUAL_CPC"),
     bid_amount: str = Field(default="", description="New bid amount"),
     start_date: str = Field(default="", description="New start date YYYY-MM-DD"),
     end_date: str = Field(default="", description="New end date YYYY-MM-DD"),
@@ -852,6 +858,7 @@ async def update_campaign(
         status: New status (optional).
         daily_budget_amount: New daily budget (optional).
         daily_budget_currency: Currency code.
+        bid_strategy: New bid strategy (optional).
         bid_amount: New bid amount (optional).
         start_date: New start date (optional).
         end_date: New end date (optional).
@@ -871,6 +878,8 @@ async def update_campaign(
                 "amount": daily_budget_amount,
                 "currencyCode": daily_budget_currency,
             }
+        if bid_strategy:
+            patch_set["bidStrategy"] = bid_strategy.upper()
         if bid_amount:
             patch_set["unitCost"] = {
                 "amount": bid_amount,
@@ -906,6 +915,67 @@ async def update_campaign(
         return f"Campaign {campaign_id} updated successfully.\nUpdated fields: {updated_fields}"
     except Exception as e:
         return f"Error updating campaign: {str(e)}"
+
+
+@mcp.tool()
+async def set_bid_strategy(
+    account_id: str = Field(description="LinkedIn Ad Account ID"),
+    campaign_id: str = Field(description="Campaign ID to update"),
+    bid_strategy: str = Field(description="Bid strategy: MAXIMUM_DELIVERY, TARGET_COST, or MANUAL_CPC"),
+    bid_amount: str = Field(default="", description="Bid amount (e.g. '5.00'). Required for TARGET_COST and MANUAL_CPC."),
+    bid_currency: str = Field(default="USD", description="Currency code for bid amount"),
+) -> str:
+    """
+    Convenience tool to update only the bid strategy and optional bid amount on a campaign.
+
+    LinkedIn supports three bid strategies:
+    - MAXIMUM_DELIVERY: Automatically optimizes bids to spend full budget (no bid amount needed)
+    - TARGET_COST: Aims for a target cost per result (bid amount = target cost)
+    - MANUAL_CPC: Manual cost-per-click bidding (bid amount = max CPC)
+
+    Args:
+        account_id: The numeric ad account ID.
+        campaign_id: The campaign ID to update.
+        bid_strategy: The bid strategy to set.
+        bid_amount: Optional bid amount (required for TARGET_COST and MANUAL_CPC).
+        bid_currency: Currency code for the bid amount.
+
+    Returns:
+        Confirmation of the bid strategy update.
+    """
+    try:
+        strategy = bid_strategy.upper()
+        valid_strategies = {"MAXIMUM_DELIVERY", "TARGET_COST", "MANUAL_CPC"}
+        if strategy not in valid_strategies:
+            return f"Invalid bid strategy '{bid_strategy}'. Must be one of: {', '.join(sorted(valid_strategies))}"
+
+        patch_set: dict = {"bidStrategy": strategy}
+
+        if bid_amount:
+            patch_set["unitCost"] = {
+                "amount": bid_amount,
+                "currencyCode": bid_currency,
+            }
+
+        body = {"patch": {"$set": patch_set}}
+        extra_headers = {"X-RestLi-Method": "PARTIAL_UPDATE"}
+
+        data = linkedin_api_request(
+            "POST",
+            f"/adAccounts/{account_id}/adCampaigns/{campaign_id}",
+            json_body=body,
+            extra_headers=extra_headers,
+        )
+        if "error" in data:
+            return f"Error setting bid strategy: {data['error']}"
+
+        lines = [f"Campaign {campaign_id} bid strategy updated successfully."]
+        lines.append(f"  Bid Strategy: {strategy}")
+        if bid_amount:
+            lines.append(f"  Bid Amount: {bid_amount} {bid_currency}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error setting bid strategy: {str(e)}"
 
 
 @mcp.tool()
@@ -2489,6 +2559,247 @@ async def resolve_accounts(
         return "\n".join(output_lines)
     except Exception as e:
         return f"Error resolving accounts: {str(e)}"
+
+# ---------------------------------------------------------------------------
+# J. Weekday-Only Scheduling (4 tools)
+# ---------------------------------------------------------------------------
+
+SCHEDULES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schedules.json")
+
+
+def _load_schedules() -> dict:
+    """Load the schedules.json file."""
+    if not os.path.exists(SCHEDULES_FILE):
+        return {"weekday_only": []}
+    try:
+        with open(SCHEDULES_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {"weekday_only": []}
+
+
+def _save_schedules(data: dict) -> None:
+    """Save data to schedules.json."""
+    with open(SCHEDULES_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+@mcp.tool()
+async def add_weekday_schedule(
+    account_id: str = Field(description="LinkedIn Ad Account ID"),
+    campaign_id: str = Field(description="Campaign ID to schedule for weekday-only delivery"),
+    campaign_name: str = Field(default="", description="Campaign name (for reference only)"),
+    timezone: str = Field(default="America/New_York", description="Timezone for schedule evaluation (e.g. 'America/New_York', 'UTC')"),
+    resume_time: str = Field(default="06:00", description="Time to resume campaign on Monday (HH:MM, 24h format)"),
+    pause_time: str = Field(default="18:00", description="Time to pause campaign on Friday (HH:MM, 24h format)"),
+) -> str:
+    """
+    Add a campaign to weekday-only scheduling.
+
+    Since LinkedIn's API does not support native dayparting, this tool stores
+    a scheduling rule in a local JSON file. Use `run_weekday_scheduler` or
+    the standalone scheduler.py script (via cron) to automatically pause
+    campaigns on Friday evening and resume them on Monday morning.
+
+    Args:
+        account_id: The numeric ad account ID.
+        campaign_id: The campaign ID.
+        campaign_name: Optional human-readable campaign name.
+        timezone: Timezone for evaluating the schedule.
+        resume_time: Time to resume on Monday (HH:MM).
+        pause_time: Time to pause on Friday (HH:MM).
+
+    Returns:
+        Confirmation that the schedule rule was added.
+    """
+    try:
+        schedules = _load_schedules()
+
+        # Check for duplicate
+        for rule in schedules["weekday_only"]:
+            if rule["campaign_id"] == str(campaign_id) and rule["account_id"] == str(account_id):
+                return f"Campaign {campaign_id} is already scheduled for weekday-only delivery."
+
+        rule = {
+            "account_id": str(account_id),
+            "campaign_id": str(campaign_id),
+            "campaign_name": campaign_name,
+            "timezone": timezone,
+            "resume_time": resume_time,
+            "pause_time": pause_time,
+            "added_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        schedules["weekday_only"].append(rule)
+        _save_schedules(schedules)
+
+        lines = [f"Campaign {campaign_id} added to weekday-only schedule."]
+        lines.append(f"  Account: {account_id}")
+        lines.append(f"  Timezone: {timezone}")
+        lines.append(f"  Resume: Monday at {resume_time}")
+        lines.append(f"  Pause: Friday at {pause_time}")
+        lines.append(f"\nTo activate, run `run_weekday_scheduler` or set up scheduler.py via cron:")
+        lines.append(f"  # Example cron (every hour):")
+        lines.append(f"  0 * * * * cd {os.path.dirname(os.path.abspath(__file__))} && python scheduler.py")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error adding weekday schedule: {str(e)}"
+
+
+@mcp.tool()
+async def remove_weekday_schedule(
+    account_id: str = Field(description="LinkedIn Ad Account ID"),
+    campaign_id: str = Field(description="Campaign ID to remove from weekday-only scheduling"),
+) -> str:
+    """
+    Remove a campaign from weekday-only scheduling.
+
+    Args:
+        account_id: The numeric ad account ID.
+        campaign_id: The campaign ID to remove.
+
+    Returns:
+        Confirmation that the schedule rule was removed.
+    """
+    try:
+        schedules = _load_schedules()
+        original_count = len(schedules["weekday_only"])
+        schedules["weekday_only"] = [
+            r for r in schedules["weekday_only"]
+            if not (r["campaign_id"] == str(campaign_id) and r["account_id"] == str(account_id))
+        ]
+
+        if len(schedules["weekday_only"]) == original_count:
+            return f"Campaign {campaign_id} was not found in weekday-only schedules."
+
+        _save_schedules(schedules)
+        return f"Campaign {campaign_id} removed from weekday-only scheduling."
+    except Exception as e:
+        return f"Error removing weekday schedule: {str(e)}"
+
+
+@mcp.tool()
+async def list_weekday_schedules(
+    format: str = Field(default="table", description="Output format: 'table', 'json', or 'csv'"),
+) -> str:
+    """
+    List all campaigns with weekday-only scheduling rules.
+
+    Returns:
+        A formatted list of all weekday-only schedule rules.
+    """
+    try:
+        schedules = _load_schedules()
+        rules = schedules.get("weekday_only", [])
+
+        if not rules:
+            return "No weekday-only schedules configured."
+
+        rows = []
+        for r in rules:
+            rows.append({
+                "account_id": r.get("account_id", ""),
+                "campaign_id": r.get("campaign_id", ""),
+                "campaign_name": r.get("campaign_name", ""),
+                "timezone": r.get("timezone", ""),
+                "resume_time": r.get("resume_time", ""),
+                "pause_time": r.get("pause_time", ""),
+                "added_at": r.get("added_at", ""),
+            })
+
+        output_lines = ["Weekday-Only Schedules:"]
+        output_lines.append("=" * 100)
+        output_lines.append(format_output(rows, format_type=format))
+        return "\n".join(output_lines)
+    except Exception as e:
+        return f"Error listing weekday schedules: {str(e)}"
+
+
+@mcp.tool()
+async def run_weekday_scheduler() -> str:
+    """
+    Manually trigger the weekday-only scheduler.
+
+    Reads scheduling rules from schedules.json, checks the current day and time
+    in each rule's timezone, and pauses or resumes campaigns accordingly:
+    - On weekdays (Mon-Fri): resumes campaigns that should be active
+    - On weekends (Sat-Sun): pauses campaigns that should be paused
+    - On Friday after pause_time: pauses campaigns
+    - On Monday before resume_time: keeps campaigns paused
+
+    Returns:
+        A summary of actions taken (campaigns paused, resumed, or unchanged).
+    """
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        try:
+            from backports.zoneinfo import ZoneInfo
+        except ImportError:
+            return "Error: zoneinfo module not available. Install Python 3.9+ or 'backports.zoneinfo'."
+
+    try:
+        schedules = _load_schedules()
+        rules = schedules.get("weekday_only", [])
+
+        if not rules:
+            return "No weekday-only schedules configured. Nothing to do."
+
+        actions = []
+        for rule in rules:
+            account_id = rule["account_id"]
+            campaign_id = rule["campaign_id"]
+            tz_name = rule.get("timezone", "UTC")
+            resume_time_str = rule.get("resume_time", "06:00")
+            pause_time_str = rule.get("pause_time", "18:00")
+
+            try:
+                tz = ZoneInfo(tz_name)
+            except Exception:
+                actions.append(f"  SKIP {campaign_id}: invalid timezone '{tz_name}'")
+                continue
+
+            now = datetime.now(tz)
+            weekday = now.weekday()  # 0=Mon, 6=Sun
+            current_time = now.strftime("%H:%M")
+
+            # Determine desired state
+            if weekday >= 5:
+                # Saturday (5) or Sunday (6) -> should be paused
+                desired_status = "PAUSED"
+            elif weekday == 4 and current_time >= pause_time_str:
+                # Friday after pause_time -> should be paused
+                desired_status = "PAUSED"
+            elif weekday == 0 and current_time < resume_time_str:
+                # Monday before resume_time -> should be paused
+                desired_status = "PAUSED"
+            else:
+                # Weekday within active hours -> should be active
+                desired_status = "ACTIVE"
+
+            # Apply the status
+            body = {"patch": {"$set": {"status": desired_status}}}
+            extra_headers = {"X-RestLi-Method": "PARTIAL_UPDATE"}
+            data = linkedin_api_request(
+                "POST",
+                f"/adAccounts/{account_id}/adCampaigns/{campaign_id}",
+                json_body=body,
+                extra_headers=extra_headers,
+            )
+
+            campaign_name = rule.get("campaign_name", campaign_id)
+            if "error" in data:
+                actions.append(f"  ERROR {campaign_name} ({campaign_id}): {data['error']}")
+            else:
+                actions.append(f"  {desired_status} -> {campaign_name} ({campaign_id}) [tz={tz_name}, day={now.strftime('%A')}, time={current_time}]")
+
+        lines = ["Weekday Scheduler Results:"]
+        lines.append("=" * 80)
+        lines.extend(actions)
+        lines.append(f"\nProcessed {len(rules)} rule(s).")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error running weekday scheduler: {str(e)}"
+
 
 # ---------------------------------------------------------------------------
 # Resources
