@@ -6,3 +6,7 @@ requests>=2.31.0
 
 # Environment configuration
 python-dotenv>=1.0.0
+
+# Dashboard
+flask>=3.0.0
+gunicorn>=22.0.0

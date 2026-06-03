@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LinkedIn Ads Scheduler</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --border: #2a2d3a;
+    --text: #e4e4e7;
+    --text-muted: #8b8d98;
+    --primary: #3b82f6;
+    --primary-hover: #2563eb;
+    --green: #22c55e;
+    --yellow: #eab308;
+    --red: #ef4444;
+    --gray: #6b7280;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+
+  /* Header */
+  .header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .header h1 { font-size: 20px; font-weight: 600; }
+  .header-info { color: var(--text-muted); font-size: 13px; }
+  .btn {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s, opacity 0.15s;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-primary { background: var(--primary); color: #fff; }
+  .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
+  .btn-sm { padding: 5px 10px; font-size: 12px; }
+  .btn-danger { background: var(--red); color: #fff; }
+  .btn-danger:hover:not(:disabled) { background: #dc2626; }
+  .btn-success { background: var(--green); color: #fff; }
+  .btn-success:hover:not(:disabled) { background: #16a34a; }
+  .btn-outline {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  .btn-outline:hover:not(:disabled) { background: var(--surface); }
+
+  /* Main */
+  .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+  .section { margin-bottom: 32px; }
+  .section-title {
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 12px;
+    color: var(--text);
+  }
+
+  /* Table */
+  .table-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left;
+    padding: 10px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  td {
+    padding: 10px 14px;
+    font-size: 13px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover { background: rgba(59,130,246,0.04); }
+
+  /* Badges */
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .badge-active { background: rgba(34,197,94,0.15); color: var(--green); }
+  .badge-paused { background: rgba(234,179,8,0.15); color: var(--yellow); }
+  .badge-draft { background: rgba(107,114,128,0.15); color: var(--gray); }
+  .schedule-info { font-size: 11px; color: var(--text-muted); line-height: 1.4; }
+
+  .actions-cell { white-space: nowrap; display: flex; gap: 6px; }
+
+  /* Modal */
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 100;
+    justify-content: center;
+    align-items: center;
+  }
+  .modal-overlay.active { display: flex; }
+  .modal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 24px;
+    width: 90%;
+    max-width: 420px;
+  }
+  .modal h2 { font-size: 17px; margin-bottom: 16px; }
+  .form-group { margin-bottom: 14px; }
+  .form-group label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .form-group select,
+  .form-group input {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 14px;
+  }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+
+  /* Scheduler panel */
+  .scheduler-panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+  }
+  .scheduler-results {
+    margin-top: 12px;
+    font-size: 13px;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+  .result-item {
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+  }
+  .result-item:last-child { border-bottom: none; }
+
+  /* Loading */
+  .spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid rgba(255,255,255,0.3);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .empty-state {
+    text-align: center;
+    padding: 40px;
+    color: var(--text-muted);
+    font-size: 14px;
+  }
+  .error-banner {
+    background: rgba(239,68,68,0.1);
+    border: 1px solid var(--red);
+    color: var(--red);
+    padding: 10px 14px;
+    border-radius: 6px;
+    margin-bottom: 16px;
+    font-size: 13px;
+  }
+
+  /* Responsive */
+  @media (max-width: 640px) {
+    .header { padding: 12px 16px; }
+    .container { padding: 16px; }
+    th, td { padding: 8px 10px; }
+    .actions-cell { flex-direction: column; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>LinkedIn Ads Scheduler</h1>
+    <div class="header-info">Account: <span id="accountId">—</span></div>
+  </div>
+  <button class="btn btn-outline" onclick="loadCampaigns()">Refresh</button>
+</div>
+
+<div class="container">
+  <div id="errorBanner" class="error-banner" style="display:none"></div>
+
+  <!-- Campaigns -->
+  <div class="section">
+    <div class="section-title">Campaigns</div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>ID</th>
+            <th>Status</th>
+            <th>Daily Budget</th>
+            <th>Weekday Schedule</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="campaignTableBody">
+          <tr><td colspan="6" class="empty-state">Loading campaigns...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Scheduler -->
+  <div class="section">
+    <div class="section-title">Scheduler</div>
+    <div class="scheduler-panel">
+      <button class="btn btn-primary" id="runSchedulerBtn" onclick="runScheduler()">Run Scheduler Now</button>
+      <div id="schedulerResults" class="scheduler-results" style="display:none"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Schedule Modal -->
+<div class="modal-overlay" id="scheduleModal">
+  <div class="modal">
+    <h2>Enable Weekday Schedule</h2>
+    <input type="hidden" id="modalCampaignId">
+    <input type="hidden" id="modalCampaignName">
+    <div class="form-group">
+      <label>Campaign</label>
+      <input type="text" id="modalCampaignLabel" disabled>
+    </div>
+    <div class="form-group">
+      <label>Timezone</label>
+      <select id="modalTimezone">
+        <option value="America/New_York">America/New_York (Eastern)</option>
+        <option value="America/Chicago">America/Chicago (Central)</option>
+        <option value="America/Denver">America/Denver (Mountain)</option>
+        <option value="America/Los_Angeles">America/Los_Angeles (Pacific)</option>
+        <option value="America/Anchorage">America/Anchorage (Alaska)</option>
+        <option value="Pacific/Honolulu">Pacific/Honolulu (Hawaii)</option>
+        <option value="UTC">UTC</option>
+        <option value="Europe/London">Europe/London</option>
+        <option value="Europe/Berlin">Europe/Berlin</option>
+        <option value="Europe/Paris">Europe/Paris</option>
+        <option value="Asia/Tokyo">Asia/Tokyo</option>
+        <option value="Asia/Shanghai">Asia/Shanghai</option>
+        <option value="Australia/Sydney">Australia/Sydney</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Resume Time (Monday)</label>
+      <input type="time" id="modalResumeTime" value="06:00">
+    </div>
+    <div class="form-group">
+      <label>Pause Time (Friday)</label>
+      <input type="time" id="modalPauseTime" value="18:00">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="modalSaveBtn" onclick="saveSchedule()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const NON_TOGGLEABLE = new Set(["DRAFT", "ARCHIVED", "CANCELED"]);
+let currentCampaigns = [];
+
+function showError(msg) {
+  const el = document.getElementById("errorBanner");
+  el.textContent = msg;
+  el.style.display = "block";
+  setTimeout(() => { el.style.display = "none"; }, 8000);
+}
+
+function statusBadge(status) {
+  let cls = "badge-draft";
+  if (status === "ACTIVE") cls = "badge-active";
+  else if (status === "PAUSED") cls = "badge-paused";
+  return `<span class="badge ${cls}">${status}</span>`;
+}
+
+function setLoading(btn, loading) {
+  if (loading) {
+    btn.disabled = true;
+    btn._origHTML = btn.innerHTML;
+    btn.innerHTML = '<span class="spinner"></span>';
+  } else {
+    btn.disabled = false;
+    btn.innerHTML = btn._origHTML || btn.innerHTML;
+  }
+}
+
+async function apiFetch(url, opts = {}) {
+  const resp = await fetch(url, {
+    headers: { "Content-Type": "application/json", ...opts.headers },
+    ...opts,
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    throw new Error(data.error || `HTTP ${resp.status}`);
+  }
+  return data;
+}
+
+// ---- Campaigns ----
+
+async function loadCampaigns() {
+  const tbody = document.getElementById("campaignTableBody");
+  tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Loading campaigns...</td></tr>';
+  try {
+    const data = await apiFetch("/api/campaigns");
+    document.getElementById("accountId").textContent = data.account_id || "—";
+    currentCampaigns = data.campaigns || [];
+    renderCampaigns();
+  } catch (e) {
+    showError("Failed to load campaigns: " + e.message);
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Error loading campaigns.</td></tr>';
+  }
+}
+
+function renderCampaigns() {
+  const tbody = document.getElementById("campaignTableBody");
+  if (!currentCampaigns.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No campaigns found.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = currentCampaigns.map(c => {
+    const disabled = NON_TOGGLEABLE.has(c.status);
+    const pauseResumeBtn = disabled ? "" :
+      c.status === "ACTIVE"
+        ? `<button class="btn btn-sm btn-outline" onclick="toggleStatus('${c.id}', 'PAUSED', this)">Pause</button>`
+        : `<button class="btn btn-sm btn-success" onclick="toggleStatus('${c.id}', 'ACTIVE', this)">Resume</button>`;
+
+    const scheduleBtn = disabled ? "" :
+      c.schedule.enabled
+        ? `<button class="btn btn-sm btn-danger" onclick="removeSchedule('${c.id}', this)">Disable Schedule</button>`
+        : `<button class="btn btn-sm btn-outline" onclick="openModal('${c.id}', '${escapeAttr(c.name)}')">Enable Schedule</button>`;
+
+    const scheduleInfo = c.schedule.enabled
+      ? `<span class="badge badge-active">Enabled</span><br><span class="schedule-info">${c.schedule.timezone}<br>${c.schedule.resume_time} — ${c.schedule.pause_time}</span>`
+      : "—";
+
+    return `<tr>
+      <td>${esc(c.name)}</td>
+      <td>${c.id}</td>
+      <td>${statusBadge(c.status)}</td>
+      <td>${c.dailyBudget}</td>
+      <td>${scheduleInfo}</td>
+      <td><div class="actions-cell">${pauseResumeBtn}${scheduleBtn}</div></td>
+    </tr>`;
+  }).join("");
+}
+
+function esc(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+function escapeAttr(s) {
+  return s.replace(/'/g, "\\'").replace(/"/g, "&quot;");
+}
+
+// ---- Pause / Resume ----
+
+async function toggleStatus(campaignId, newStatus, btn) {
+  setLoading(btn, true);
+  try {
+    await apiFetch(`/api/campaigns/${campaignId}/status`, {
+      method: "POST",
+      body: JSON.stringify({ status: newStatus }),
+    });
+    await loadCampaigns();
+  } catch (e) {
+    showError(`Failed to set ${newStatus}: ${e.message}`);
+    setLoading(btn, false);
+  }
+}
+
+// ---- Schedule modal ----
+
+function openModal(campaignId, campaignName) {
+  document.getElementById("modalCampaignId").value = campaignId;
+  document.getElementById("modalCampaignName").value = campaignName;
+  document.getElementById("modalCampaignLabel").value = `${campaignName} (${campaignId})`;
+  document.getElementById("modalTimezone").value = "America/New_York";
+  document.getElementById("modalResumeTime").value = "06:00";
+  document.getElementById("modalPauseTime").value = "18:00";
+  document.getElementById("scheduleModal").classList.add("active");
+}
+
+function closeModal() {
+  document.getElementById("scheduleModal").classList.remove("active");
+}
+
+async function saveSchedule() {
+  const btn = document.getElementById("modalSaveBtn");
+  setLoading(btn, true);
+  const campaignId = document.getElementById("modalCampaignId").value;
+  const campaignName = document.getElementById("modalCampaignName").value;
+  try {
+    await apiFetch("/api/schedules", {
+      method: "POST",
+      body: JSON.stringify({
+        campaign_id: campaignId,
+        campaign_name: campaignName,
+        timezone: document.getElementById("modalTimezone").value,
+        resume_time: document.getElementById("modalResumeTime").value,
+        pause_time: document.getElementById("modalPauseTime").value,
+      }),
+    });
+    closeModal();
+    await loadCampaigns();
+  } catch (e) {
+    showError("Failed to save schedule: " + e.message);
+  } finally {
+    setLoading(btn, false);
+  }
+}
+
+async function removeSchedule(campaignId, btn) {
+  setLoading(btn, true);
+  try {
+    await apiFetch(`/api/schedules/${campaignId}`, { method: "DELETE" });
+    await loadCampaigns();
+  } catch (e) {
+    showError("Failed to remove schedule: " + e.message);
+    setLoading(btn, false);
+  }
+}
+
+// ---- Scheduler ----
+
+async function runScheduler() {
+  const btn = document.getElementById("runSchedulerBtn");
+  const results = document.getElementById("schedulerResults");
+  setLoading(btn, true);
+  results.style.display = "none";
+  try {
+    const data = await apiFetch("/api/scheduler/run", { method: "POST" });
+    results.style.display = "block";
+    if (!data.actions || !data.actions.length) {
+      results.innerHTML = '<div class="result-item" style="color:var(--text-muted)">No rules configured.</div>';
+    } else {
+      results.innerHTML = data.actions.map(a => {
+        let badge = "";
+        if (a.action === "ACTIVE") badge = '<span class="badge badge-active">ACTIVE</span>';
+        else if (a.action === "PAUSED") badge = '<span class="badge badge-paused">PAUSED</span>';
+        else if (a.action === "ERROR") badge = '<span class="badge badge-draft">ERROR</span>';
+        else badge = '<span class="badge badge-draft">SKIP</span>';
+
+        const detail = a.action === "ERROR" || a.action === "SKIP"
+          ? `<span style="color:var(--text-muted)">${esc(a.reason || "")}</span>`
+          : `<span style="color:var(--text-muted)">${a.day} ${a.time} (${a.timezone})</span>`;
+
+        return `<div class="result-item">${badge} <strong>${esc(a.campaign_name)}</strong> ${detail}</div>`;
+      }).join("");
+    }
+    results.innerHTML += `<div style="margin-top:8px;color:var(--text-muted);font-size:12px">${esc(data.message)}</div>`;
+    await loadCampaigns();
+  } catch (e) {
+    showError("Scheduler error: " + e.message);
+  } finally {
+    setLoading(btn, false);
+  }
+}
+
+// ---- Init ----
+document.addEventListener("DOMContentLoaded", loadCampaigns);
+</script>
+</body>
+</html>
