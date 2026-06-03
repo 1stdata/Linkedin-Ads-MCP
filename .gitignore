@@ -53,5 +53,6 @@ site/
 
 google_ads_token.json
 linkedin_token.json
+schedules.json
 
 uv.lock
