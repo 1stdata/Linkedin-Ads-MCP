@@ -168,13 +168,13 @@ def run_scheduler() -> None:
     token = get_access_token()
     logger.info("Processing %d weekday-only rule(s)...", len(rules))
 
+    DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
     for rule in rules:
         account_id = rule["account_id"]
         campaign_id = rule["campaign_id"]
         campaign_name = rule.get("campaign_name", campaign_id)
         tz_name = rule.get("timezone", "UTC")
-        resume_time = rule.get("resume_time", "06:00")
-        pause_time = rule.get("pause_time", "18:00")
 
         try:
             tz = ZoneInfo(tz_name)
@@ -186,14 +186,23 @@ def run_scheduler() -> None:
         weekday = now.weekday()  # 0=Mon, 6=Sun
         current_time = now.strftime("%H:%M")
 
-        if weekday >= 5:
-            desired = "PAUSED"
-        elif weekday == 4 and current_time >= pause_time:
-            desired = "PAUSED"
-        elif weekday == 0 and current_time < resume_time:
-            desired = "PAUSED"
+        if "hours" in rule:
+            # New hours-grid model
+            day_key = DAY_KEYS[weekday]
+            active_hours = rule["hours"].get(day_key, [])
+            desired = "ACTIVE" if now.hour in active_hours else "PAUSED"
         else:
-            desired = "ACTIVE"
+            # Legacy resume_time/pause_time model
+            resume_time = rule.get("resume_time", "06:00")
+            pause_time = rule.get("pause_time", "18:00")
+            if weekday >= 5:
+                desired = "PAUSED"
+            elif weekday == 4 and current_time >= pause_time:
+                desired = "PAUSED"
+            elif weekday == 0 and current_time < resume_time:
+                desired = "PAUSED"
+            else:
+                desired = "ACTIVE"
 
         ok = set_campaign_status(account_id, campaign_id, desired, token)
         if ok:

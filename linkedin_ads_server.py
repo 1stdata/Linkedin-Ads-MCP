@@ -2590,24 +2590,29 @@ async def add_weekday_schedule(
     campaign_id: str = Field(description="Campaign ID to schedule for weekday-only delivery"),
     campaign_name: str = Field(default="", description="Campaign name (for reference only)"),
     timezone: str = Field(default="America/New_York", description="Timezone for schedule evaluation (e.g. 'America/New_York', 'UTC')"),
-    resume_time: str = Field(default="06:00", description="Time to resume campaign on Monday (HH:MM, 24h format)"),
-    pause_time: str = Field(default="18:00", description="Time to pause campaign on Friday (HH:MM, 24h format)"),
+    resume_time: str = Field(default="06:00", description="Time to resume campaign on Monday (HH:MM, 24h format). Ignored if hours is provided."),
+    pause_time: str = Field(default="18:00", description="Time to pause campaign on Friday (HH:MM, 24h format). Ignored if hours is provided."),
+    hours: str = Field(default="", description="Optional JSON string with per-day active hours, e.g. '{\"mon\":[6,7,8,...],\"tue\":[...],...}'. Keys: sun,mon,tue,wed,thu,fri,sat. Values: arrays of integers 0-23. If provided, resume_time/pause_time are ignored."),
 ) -> str:
     """
     Add a campaign to weekday-only scheduling.
 
     Since LinkedIn's API does not support native dayparting, this tool stores
     a scheduling rule in a local JSON file. Use `run_weekday_scheduler` or
-    the standalone scheduler.py script (via cron) to automatically pause
-    campaigns on Friday evening and resume them on Monday morning.
+    the standalone scheduler.py script (via cron) to automatically pause/resume
+    campaigns based on the schedule.
+
+    You can either provide simple resume_time/pause_time (weekdays only), or
+    a full per-day hours grid for fine-grained control over every day and hour.
 
     Args:
         account_id: The numeric ad account ID.
         campaign_id: The campaign ID.
         campaign_name: Optional human-readable campaign name.
         timezone: Timezone for evaluating the schedule.
-        resume_time: Time to resume on Monday (HH:MM).
-        pause_time: Time to pause on Friday (HH:MM).
+        resume_time: Time to resume on Monday (HH:MM). Ignored if hours is provided.
+        pause_time: Time to pause on Friday (HH:MM). Ignored if hours is provided.
+        hours: Optional JSON string with per-day active hours grid.
 
     Returns:
         Confirmation that the schedule rule was added.
@@ -2625,18 +2630,38 @@ async def add_weekday_schedule(
             "campaign_id": str(campaign_id),
             "campaign_name": campaign_name,
             "timezone": timezone,
-            "resume_time": resume_time,
-            "pause_time": pause_time,
             "added_at": datetime.now().isoformat(timespec="seconds"),
         }
+
+        if hours:
+            parsed_hours = json.loads(hours)
+            rule["hours"] = parsed_hours
+        else:
+            # Build hours grid from resume_time/pause_time for backward compat
+            rt = int(resume_time.split(":")[0])
+            pt = int(pause_time.split(":")[0])
+            wd_hours = list(range(rt, pt))
+            rule["hours"] = {
+                "sun": [], "mon": wd_hours[:], "tue": wd_hours[:],
+                "wed": wd_hours[:], "thu": wd_hours[:], "fri": wd_hours[:],
+                "sat": [],
+            }
+            # Also store legacy fields for backward compat
+            rule["resume_time"] = resume_time
+            rule["pause_time"] = pause_time
+
         schedules["weekday_only"].append(rule)
         _save_schedules(schedules)
 
         lines = [f"Campaign {campaign_id} added to weekday-only schedule."]
         lines.append(f"  Account: {account_id}")
         lines.append(f"  Timezone: {timezone}")
-        lines.append(f"  Resume: Monday at {resume_time}")
-        lines.append(f"  Pause: Friday at {pause_time}")
+        if "hours" in rule and not hours:
+            lines.append(f"  Resume: Monday at {resume_time}")
+            lines.append(f"  Pause: Friday at {pause_time}")
+        else:
+            active_days = [d for d in ["sun","mon","tue","wed","thu","fri","sat"] if rule["hours"].get(d)]
+            lines.append(f"  Active days: {', '.join(active_days) if active_days else 'none'}")
         lines.append(f"\nTo activate, run `run_weekday_scheduler` or set up scheduler.py via cron:")
         lines.append(f"  # Example cron (every hour):")
         lines.append(f"  0 * * * * cd {os.path.dirname(os.path.abspath(__file__))} && python scheduler.py")
@@ -2696,15 +2721,21 @@ async def list_weekday_schedules(
 
         rows = []
         for r in rules:
-            rows.append({
+            row = {
                 "account_id": r.get("account_id", ""),
                 "campaign_id": r.get("campaign_id", ""),
                 "campaign_name": r.get("campaign_name", ""),
                 "timezone": r.get("timezone", ""),
-                "resume_time": r.get("resume_time", ""),
-                "pause_time": r.get("pause_time", ""),
                 "added_at": r.get("added_at", ""),
-            })
+            }
+            if "hours" in r:
+                # Summarize hours grid
+                active_days = [d for d in ["mon","tue","wed","thu","fri","sat","sun"] if r["hours"].get(d)]
+                total_hours = sum(len(r["hours"].get(d, [])) for d in ["sun","mon","tue","wed","thu","fri","sat"])
+                row["schedule"] = f"{len(active_days)} days, {total_hours} hrs/wk"
+            else:
+                row["schedule"] = f"Mon {r.get('resume_time','')} – Fri {r.get('pause_time','')}"
+            rows.append(row)
 
         output_lines = ["Weekday-Only Schedules:"]
         output_lines.append("=" * 100)
@@ -2737,6 +2768,8 @@ async def run_weekday_scheduler() -> str:
         except ImportError:
             return "Error: zoneinfo module not available. Install Python 3.9+ or 'backports.zoneinfo'."
 
+    DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
     try:
         schedules = _load_schedules()
         rules = schedules.get("weekday_only", [])
@@ -2749,8 +2782,6 @@ async def run_weekday_scheduler() -> str:
             account_id = rule["account_id"]
             campaign_id = rule["campaign_id"]
             tz_name = rule.get("timezone", "UTC")
-            resume_time_str = rule.get("resume_time", "06:00")
-            pause_time_str = rule.get("pause_time", "18:00")
 
             try:
                 tz = ZoneInfo(tz_name)
@@ -2762,19 +2793,23 @@ async def run_weekday_scheduler() -> str:
             weekday = now.weekday()  # 0=Mon, 6=Sun
             current_time = now.strftime("%H:%M")
 
-            # Determine desired state
-            if weekday >= 5:
-                # Saturday (5) or Sunday (6) -> should be paused
-                desired_status = "PAUSED"
-            elif weekday == 4 and current_time >= pause_time_str:
-                # Friday after pause_time -> should be paused
-                desired_status = "PAUSED"
-            elif weekday == 0 and current_time < resume_time_str:
-                # Monday before resume_time -> should be paused
-                desired_status = "PAUSED"
+            if "hours" in rule:
+                # New hours-grid model
+                day_key = DAY_KEYS[weekday]
+                active_hours = rule["hours"].get(day_key, [])
+                desired_status = "ACTIVE" if now.hour in active_hours else "PAUSED"
             else:
-                # Weekday within active hours -> should be active
-                desired_status = "ACTIVE"
+                # Legacy resume_time/pause_time model
+                resume_time_str = rule.get("resume_time", "06:00")
+                pause_time_str = rule.get("pause_time", "18:00")
+                if weekday >= 5:
+                    desired_status = "PAUSED"
+                elif weekday == 4 and current_time >= pause_time_str:
+                    desired_status = "PAUSED"
+                elif weekday == 0 and current_time < resume_time_str:
+                    desired_status = "PAUSED"
+                else:
+                    desired_status = "ACTIVE"
 
             # Apply the status
             body = {"patch": {"$set": {"status": desired_status}}}

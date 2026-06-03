@@ -77,6 +77,24 @@
     color: var(--text);
   }
 
+  /* Filter bar */
+  .filter-bar {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .filter-bar select {
+    padding: 7px 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+    min-width: 180px;
+  }
+
   /* Table */
   .table-wrap {
     overflow-x: auto;
@@ -139,7 +157,9 @@
     border-radius: 10px;
     padding: 24px;
     width: 90%;
-    max-width: 420px;
+    max-width: 720px;
+    max-height: 90vh;
+    overflow-y: auto;
   }
   .modal h2 { font-size: 17px; margin-bottom: 16px; }
   .form-group { margin-bottom: 14px; }
@@ -163,6 +183,57 @@
     font-size: 14px;
   }
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+
+  /* Weekly grid */
+  .grid-presets {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+  }
+  .grid-presets .btn { padding: 4px 10px; font-size: 11px; }
+  .week-grid-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .week-grid {
+    display: grid;
+    grid-template-columns: 48px repeat(24, 24px);
+    grid-template-rows: 20px repeat(7, 28px);
+    gap: 1px;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .week-grid .hdr {
+    font-size: 10px;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .week-grid .day-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    padding-left: 2px;
+  }
+  .week-grid .cell {
+    width: 24px;
+    height: 28px;
+    border-radius: 3px;
+    background: rgba(255,255,255,0.05);
+    cursor: pointer;
+    transition: background 0.08s;
+  }
+  .week-grid .cell.active {
+    background: var(--primary);
+  }
+  .week-grid .cell:hover {
+    outline: 1px solid var(--primary);
+    outline-offset: -1px;
+  }
 
   /* Scheduler panel */
   .scheduler-panel {
@@ -239,20 +310,34 @@
   <!-- Campaigns -->
   <div class="section">
     <div class="section-title">Campaigns</div>
+    <div class="filter-bar">
+      <select id="filterGroup" onchange="loadCampaigns()">
+        <option value="">All Groups</option>
+      </select>
+      <select id="filterStatus" onchange="loadCampaigns()">
+        <option value="">All Statuses</option>
+        <option value="ACTIVE">ACTIVE</option>
+        <option value="PAUSED">PAUSED</option>
+        <option value="DRAFT">DRAFT</option>
+        <option value="ARCHIVED">ARCHIVED</option>
+        <option value="CANCELED">CANCELED</option>
+      </select>
+    </div>
     <div class="table-wrap">
       <table>
         <thead>
           <tr>
             <th>Name</th>
             <th>ID</th>
+            <th>Group</th>
             <th>Status</th>
             <th>Daily Budget</th>
-            <th>Weekday Schedule</th>
+            <th>Schedule</th>
             <th>Actions</th>
           </tr>
         </thead>
         <tbody id="campaignTableBody">
-          <tr><td colspan="6" class="empty-state">Loading campaigns...</td></tr>
+          <tr><td colspan="7" class="empty-state">Loading campaigns...</td></tr>
         </tbody>
       </table>
     </div>
@@ -271,7 +356,7 @@
 <!-- Schedule Modal -->
 <div class="modal-overlay" id="scheduleModal">
   <div class="modal">
-    <h2>Enable Weekday Schedule</h2>
+    <h2>Weekly Schedule</h2>
     <input type="hidden" id="modalCampaignId">
     <input type="hidden" id="modalCampaignName">
     <div class="form-group">
@@ -297,12 +382,15 @@
       </select>
     </div>
     <div class="form-group">
-      <label>Resume Time (Monday)</label>
-      <input type="time" id="modalResumeTime" value="06:00">
-    </div>
-    <div class="form-group">
-      <label>Pause Time (Friday)</label>
-      <input type="time" id="modalPauseTime" value="18:00">
+      <label>Active Hours</label>
+      <div class="grid-presets">
+        <button class="btn btn-outline" onclick="presetWeekdays()">Weekdays 6a–6p</button>
+        <button class="btn btn-outline" onclick="preset247()">24/7</button>
+        <button class="btn btn-outline" onclick="presetClear()">Clear All</button>
+      </div>
+      <div class="week-grid-wrap">
+        <div class="week-grid" id="weekGrid"></div>
+      </div>
     </div>
     <div class="modal-actions">
       <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
@@ -313,7 +401,14 @@
 
 <script>
 const NON_TOGGLEABLE = new Set(["DRAFT", "ARCHIVED", "CANCELED"]);
+const DAY_KEYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
 let currentCampaigns = [];
+let campaignGroups = {};  // id -> name
+let gridHours = { sun:[], mon:[], tue:[], wed:[], thu:[], fri:[], sat:[] };
+let isDragging = false;
+let dragActivate = true;
 
 function showError(msg) {
   const el = document.getElementById("errorBanner");
@@ -352,26 +447,102 @@ async function apiFetch(url, opts = {}) {
   return data;
 }
 
+// ---- Campaign Groups ----
+
+async function loadCampaignGroups() {
+  try {
+    const data = await apiFetch("/api/campaign-groups");
+    const sel = document.getElementById("filterGroup");
+    const current = sel.value;
+    sel.innerHTML = '<option value="">All Groups</option>';
+    (data.groups || []).forEach(g => {
+      campaignGroups[g.id] = g.name;
+      const opt = document.createElement("option");
+      opt.value = g.id;
+      opt.textContent = g.name;
+      sel.appendChild(opt);
+    });
+    sel.value = current;
+  } catch (e) {
+    // Non-fatal — filters just won't populate
+  }
+}
+
 // ---- Campaigns ----
 
 async function loadCampaigns() {
   const tbody = document.getElementById("campaignTableBody");
-  tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Loading campaigns...</td></tr>';
+  tbody.innerHTML = '<tr><td colspan="7" class="empty-state">Loading campaigns...</td></tr>';
+
+  const params = new URLSearchParams();
+  const groupId = document.getElementById("filterGroup").value;
+  const statusVal = document.getElementById("filterStatus").value;
+  if (groupId) params.set("campaign_group_id", groupId);
+  if (statusVal) params.set("status", statusVal);
+  const qs = params.toString() ? "?" + params.toString() : "";
+
   try {
-    const data = await apiFetch("/api/campaigns");
+    const data = await apiFetch("/api/campaigns" + qs);
     document.getElementById("accountId").textContent = data.account_id || "—";
     currentCampaigns = data.campaigns || [];
     renderCampaigns();
   } catch (e) {
     showError("Failed to load campaigns: " + e.message);
-    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Error loading campaigns.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">Error loading campaigns.</td></tr>';
   }
+}
+
+function summarizeSchedule(schedule) {
+  if (!schedule.enabled) return "—";
+  // Legacy format
+  if (schedule.resume_time && schedule.pause_time) {
+    return `<span class="badge badge-active">Enabled</span><br><span class="schedule-info">${esc(schedule.timezone)}<br>Mon–Fri ${schedule.resume_time}–${schedule.pause_time}</span>`;
+  }
+  // New hours format
+  if (schedule.hours) {
+    const h = schedule.hours;
+    const weekdays = ["mon","tue","wed","thu","fri"];
+    const weekend = ["sat","sun"];
+    const allDays = DAY_KEYS;
+
+    // Check 24/7
+    const is247 = allDays.every(d => (h[d] || []).length === 24);
+    if (is247) {
+      return `<span class="badge badge-active">Enabled</span><br><span class="schedule-info">${esc(schedule.timezone)}<br>24/7</span>`;
+    }
+
+    // Check if all empty
+    const allEmpty = allDays.every(d => (h[d] || []).length === 0);
+    if (allEmpty) {
+      return `<span class="badge badge-active">Enabled</span><br><span class="schedule-info">${esc(schedule.timezone)}<br>All paused</span>`;
+    }
+
+    // Check weekdays-same pattern
+    const wdSame = weekdays.every(d => JSON.stringify((h[d]||[]).sort((a,b)=>a-b)) === JSON.stringify((h["mon"]||[]).sort((a,b)=>a-b)));
+    const weEmpty = weekend.every(d => (h[d] || []).length === 0);
+    if (wdSame && weEmpty && (h["mon"]||[]).length > 0) {
+      const hrs = (h["mon"]||[]).sort((a,b)=>a-b);
+      const start = hrs[0];
+      const end = hrs[hrs.length - 1] + 1;
+      // Check contiguous
+      const contiguous = hrs.length === (end - start);
+      if (contiguous) {
+        const fmtH = v => { const ap = v >= 12 ? 'p' : 'a'; return (v % 12 || 12) + ap; };
+        return `<span class="badge badge-active">Enabled</span><br><span class="schedule-info">${esc(schedule.timezone)}<br>Mon–Fri ${fmtH(start)}–${fmtH(end)}</span>`;
+      }
+    }
+
+    // Custom
+    const activeDays = allDays.filter(d => (h[d]||[]).length > 0);
+    return `<span class="badge badge-active">Enabled</span><br><span class="schedule-info">${esc(schedule.timezone)}<br>Custom (${activeDays.length} day${activeDays.length !== 1 ? 's' : ''})</span>`;
+  }
+  return `<span class="badge badge-active">Enabled</span><br><span class="schedule-info">${esc(schedule.timezone)}</span>`;
 }
 
 function renderCampaigns() {
   const tbody = document.getElementById("campaignTableBody");
   if (!currentCampaigns.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No campaigns found.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No campaigns found.</td></tr>';
     return;
   }
   tbody.innerHTML = currentCampaigns.map(c => {
@@ -383,19 +554,18 @@ function renderCampaigns() {
 
     const scheduleBtn = disabled ? "" :
       c.schedule.enabled
-        ? `<button class="btn btn-sm btn-danger" onclick="removeSchedule('${c.id}', this)">Disable Schedule</button>`
-        : `<button class="btn btn-sm btn-outline" onclick="openModal('${c.id}', '${escapeAttr(c.name)}')">Enable Schedule</button>`;
+        ? `<button class="btn btn-sm btn-danger" onclick="removeSchedule('${c.id}', this)">Disable</button> <button class="btn btn-sm btn-outline" onclick="openModal('${c.id}', '${escapeAttr(c.name)}', true)">Edit</button>`
+        : `<button class="btn btn-sm btn-outline" onclick="openModal('${c.id}', '${escapeAttr(c.name)}', false)">Enable Schedule</button>`;
 
-    const scheduleInfo = c.schedule.enabled
-      ? `<span class="badge badge-active">Enabled</span><br><span class="schedule-info">${c.schedule.timezone}<br>${c.schedule.resume_time} — ${c.schedule.pause_time}</span>`
-      : "—";
+    const groupName = c.campaignGroup ? esc(campaignGroups[c.campaignGroup] || c.campaignGroup) : "—";
 
     return `<tr>
       <td>${esc(c.name)}</td>
       <td>${c.id}</td>
+      <td>${groupName}</td>
       <td>${statusBadge(c.status)}</td>
       <td>${c.dailyBudget}</td>
-      <td>${scheduleInfo}</td>
+      <td>${summarizeSchedule(c.schedule)}</td>
       <td><div class="actions-cell">${pauseResumeBtn}${scheduleBtn}</div></td>
     </tr>`;
   }).join("");
@@ -426,15 +596,173 @@ async function toggleStatus(campaignId, newStatus, btn) {
   }
 }
 
+// ---- Weekly Grid ----
+
+function buildGrid() {
+  const grid = document.getElementById("weekGrid");
+  grid.innerHTML = "";
+
+  // Corner
+  const corner = document.createElement("div");
+  corner.className = "hdr";
+  grid.appendChild(corner);
+
+  // Hour headers
+  for (let h = 0; h < 24; h++) {
+    const hdr = document.createElement("div");
+    hdr.className = "hdr";
+    hdr.textContent = h;
+    grid.appendChild(hdr);
+  }
+
+  // Day rows
+  for (let d = 0; d < 7; d++) {
+    const label = document.createElement("div");
+    label.className = "day-label";
+    label.textContent = DAY_LABELS[d];
+    grid.appendChild(label);
+
+    for (let h = 0; h < 24; h++) {
+      const cell = document.createElement("div");
+      cell.className = "cell";
+      cell.dataset.day = DAY_KEYS[d];
+      cell.dataset.hour = h;
+      if (gridHours[DAY_KEYS[d]].includes(h)) cell.classList.add("active");
+
+      cell.addEventListener("mousedown", onCellMouseDown);
+      cell.addEventListener("mouseenter", onCellMouseEnter);
+      cell.addEventListener("touchstart", onCellTouchStart, { passive: false });
+      cell.addEventListener("touchmove", onCellTouchMove, { passive: false });
+
+      grid.appendChild(cell);
+    }
+  }
+}
+
+function onCellMouseDown(e) {
+  e.preventDefault();
+  isDragging = true;
+  const day = e.target.dataset.day;
+  const hour = parseInt(e.target.dataset.hour);
+  dragActivate = !gridHours[day].includes(hour);
+  toggleCell(day, hour);
+}
+
+function onCellMouseEnter(e) {
+  if (!isDragging) return;
+  const day = e.target.dataset.day;
+  const hour = parseInt(e.target.dataset.hour);
+  toggleCell(day, hour);
+}
+
+function onCellTouchStart(e) {
+  e.preventDefault();
+  isDragging = true;
+  const touch = e.touches[0];
+  const el = document.elementFromPoint(touch.clientX, touch.clientY);
+  if (el && el.dataset.day !== undefined) {
+    const day = el.dataset.day;
+    const hour = parseInt(el.dataset.hour);
+    dragActivate = !gridHours[day].includes(hour);
+    toggleCell(day, hour);
+  }
+}
+
+function onCellTouchMove(e) {
+  e.preventDefault();
+  if (!isDragging) return;
+  const touch = e.touches[0];
+  const el = document.elementFromPoint(touch.clientX, touch.clientY);
+  if (el && el.dataset.day !== undefined) {
+    toggleCell(el.dataset.day, parseInt(el.dataset.hour));
+  }
+}
+
+document.addEventListener("mouseup", () => { isDragging = false; });
+document.addEventListener("touchend", () => { isDragging = false; });
+
+function toggleCell(day, hour) {
+  const arr = gridHours[day];
+  const idx = arr.indexOf(hour);
+  if (dragActivate) {
+    if (idx === -1) arr.push(hour);
+  } else {
+    if (idx !== -1) arr.splice(idx, 1);
+  }
+  // Update visual
+  const cell = document.querySelector(`.cell[data-day="${day}"][data-hour="${hour}"]`);
+  if (cell) {
+    if (dragActivate) cell.classList.add("active");
+    else cell.classList.remove("active");
+  }
+}
+
+function presetWeekdays() {
+  const wdHours = [];
+  for (let h = 6; h < 18; h++) wdHours.push(h);
+  gridHours = {
+    sun: [], mon: [...wdHours], tue: [...wdHours], wed: [...wdHours],
+    thu: [...wdHours], fri: [...wdHours], sat: []
+  };
+  buildGrid();
+}
+
+function preset247() {
+  const all = [];
+  for (let h = 0; h < 24; h++) all.push(h);
+  gridHours = {
+    sun: [...all], mon: [...all], tue: [...all], wed: [...all],
+    thu: [...all], fri: [...all], sat: [...all]
+  };
+  buildGrid();
+}
+
+function presetClear() {
+  gridHours = { sun:[], mon:[], tue:[], wed:[], thu:[], fri:[], sat:[] };
+  buildGrid();
+}
+
 // ---- Schedule modal ----
 
-function openModal(campaignId, campaignName) {
+function openModal(campaignId, campaignName, isEdit) {
   document.getElementById("modalCampaignId").value = campaignId;
   document.getElementById("modalCampaignName").value = campaignName;
   document.getElementById("modalCampaignLabel").value = `${campaignName} (${campaignId})`;
   document.getElementById("modalTimezone").value = "America/New_York";
-  document.getElementById("modalResumeTime").value = "06:00";
-  document.getElementById("modalPauseTime").value = "18:00";
+
+  // If editing, load existing schedule
+  if (isEdit) {
+    const c = currentCampaigns.find(x => x.id === campaignId);
+    if (c && c.schedule && c.schedule.enabled) {
+      if (c.schedule.timezone) {
+        document.getElementById("modalTimezone").value = c.schedule.timezone;
+      }
+      if (c.schedule.hours) {
+        gridHours = {};
+        DAY_KEYS.forEach(d => {
+          gridHours[d] = [...(c.schedule.hours[d] || [])];
+        });
+      } else {
+        // Convert legacy to grid for display
+        const rt = parseInt((c.schedule.resume_time || "06:00").split(":")[0]);
+        const pt = parseInt((c.schedule.pause_time || "18:00").split(":")[0]);
+        const wdHours = [];
+        for (let h = rt; h < pt; h++) wdHours.push(h);
+        gridHours = {
+          sun: [], mon: [...wdHours], tue: [...wdHours], wed: [...wdHours],
+          thu: [...wdHours], fri: [...wdHours], sat: []
+        };
+      }
+    } else {
+      presetWeekdays();
+      buildGrid();
+    }
+  } else {
+    // Default preset
+    presetWeekdays();
+  }
+
+  buildGrid();
   document.getElementById("scheduleModal").classList.add("active");
 }
 
@@ -447,15 +775,27 @@ async function saveSchedule() {
   setLoading(btn, true);
   const campaignId = document.getElementById("modalCampaignId").value;
   const campaignName = document.getElementById("modalCampaignName").value;
+  const timezone = document.getElementById("modalTimezone").value;
+
+  // Sort each day's hours
+  const hours = {};
+  DAY_KEYS.forEach(d => {
+    hours[d] = [...gridHours[d]].sort((a, b) => a - b);
+  });
+
   try {
+    // Remove existing schedule first (ignore 404)
+    try {
+      await apiFetch(`/api/schedules/${campaignId}`, { method: "DELETE" });
+    } catch (e) { /* ok if not found */ }
+
     await apiFetch("/api/schedules", {
       method: "POST",
       body: JSON.stringify({
         campaign_id: campaignId,
         campaign_name: campaignName,
-        timezone: document.getElementById("modalTimezone").value,
-        resume_time: document.getElementById("modalResumeTime").value,
-        pause_time: document.getElementById("modalPauseTime").value,
+        timezone: timezone,
+        hours: hours,
       }),
     });
     closeModal();
@@ -515,7 +855,10 @@ async function runScheduler() {
 }
 
 // ---- Init ----
-document.addEventListener("DOMContentLoaded", loadCampaigns);
+document.addEventListener("DOMContentLoaded", () => {
+  loadCampaignGroups();
+  loadCampaigns();
+});
 </script>
 </body>
 </html>

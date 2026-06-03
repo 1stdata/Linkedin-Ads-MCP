@@ -87,6 +87,34 @@ def index():
     return render_template("dashboard.html")
 
 
+@app.route("/api/campaign-groups")
+@requires_auth
+def api_campaign_groups():
+    """List campaign groups for the account."""
+    account_id = request.args.get("account_id", LINKEDIN_BUSINESS_ACCOUNT_ID)
+    if not account_id:
+        return jsonify({"error": "No account_id provided and LINKEDIN_BUSINESS_ACCOUNT_ID not set"}), 400
+
+    try:
+        elements = linkedin_paginated_request(
+            f"/adAccounts/{account_id}/adCampaignGroups",
+            params={"q": "search"},
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    groups = []
+    for el in elements:
+        gid = extract_id_from_urn(el.get("id", "")) or str(el.get("id", ""))
+        groups.append({
+            "id": gid,
+            "name": el.get("name", ""),
+            "status": el.get("status", ""),
+        })
+
+    return jsonify({"account_id": account_id, "groups": groups})
+
+
 @app.route("/api/campaigns")
 @requires_auth
 def api_campaigns():
@@ -95,10 +123,23 @@ def api_campaigns():
     if not account_id:
         return jsonify({"error": "No account_id provided and LINKEDIN_BUSINESS_ACCOUNT_ID not set"}), 400
 
+    # Build search criteria
+    search_parts = [f"account:(values:List(urn:li:sponsoredAccount:{account_id}))"]
+
+    filter_status = request.args.get("status")
+    if filter_status:
+        search_parts.append(f"status:(values:List({filter_status}))")
+
+    filter_group = request.args.get("campaign_group_id")
+    if filter_group:
+        search_parts.append(f"campaignGroup:(values:List(urn:li:sponsoredCampaignGroup:{filter_group}))")
+
+    search_param = ",".join(search_parts)
+
     try:
         elements = linkedin_paginated_request(
             f"/adAccounts/{account_id}/adCampaigns",
-            params={"q": "search"},
+            params={"q": "search", "search": f"({search_param})"},
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -115,18 +156,30 @@ def api_campaigns():
         budget = el.get("dailyBudget", {})
         schedule = schedule_map.get(cid)
 
+        schedule_obj = {"enabled": False}
+        if schedule:
+            schedule_obj = {
+                "enabled": True,
+                "timezone": schedule["timezone"],
+            }
+            if "hours" in schedule:
+                schedule_obj["hours"] = schedule["hours"]
+            else:
+                schedule_obj["resume_time"] = schedule.get("resume_time", "06:00")
+                schedule_obj["pause_time"] = schedule.get("pause_time", "18:00")
+
+        # Extract campaign group URN
+        cg_urn = el.get("campaignGroup", "")
+        cg_id = extract_id_from_urn(cg_urn) if cg_urn else ""
+
         campaigns.append({
             "id": cid,
             "name": el.get("name", ""),
             "status": el.get("status", ""),
             "dailyBudget": f"{budget.get('amount', 'N/A')} {budget.get('currencyCode', '')}".strip() if budget else "N/A",
             "objectiveType": el.get("objectiveType", ""),
-            "schedule": {
-                "enabled": True,
-                "timezone": schedule["timezone"],
-                "resume_time": schedule["resume_time"],
-                "pause_time": schedule["pause_time"],
-            } if schedule else {"enabled": False},
+            "campaignGroup": cg_id,
+            "schedule": schedule_obj,
         })
 
     return jsonify({
@@ -195,10 +248,15 @@ def api_add_schedule():
         "campaign_id": campaign_id,
         "campaign_name": payload.get("campaign_name", ""),
         "timezone": payload.get("timezone", "America/New_York"),
-        "resume_time": payload.get("resume_time", "06:00"),
-        "pause_time": payload.get("pause_time", "18:00"),
         "added_at": datetime.now().isoformat(timespec="seconds"),
     }
+
+    if "hours" in payload:
+        rule["hours"] = payload["hours"]
+    else:
+        rule["resume_time"] = payload.get("resume_time", "06:00")
+        rule["pause_time"] = payload.get("pause_time", "18:00")
+
     schedules["weekday_only"].append(rule)
     _save_schedules(schedules)
 
@@ -240,14 +298,14 @@ def api_run_scheduler():
     if not rules:
         return jsonify({"message": "No weekday-only schedules configured.", "actions": []})
 
+    DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
     actions = []
     for rule in rules:
         account_id = rule["account_id"]
         campaign_id = rule["campaign_id"]
         campaign_name = rule.get("campaign_name", campaign_id)
         tz_name = rule.get("timezone", "UTC")
-        resume_time_str = rule.get("resume_time", "06:00")
-        pause_time_str = rule.get("pause_time", "18:00")
 
         try:
             tz = ZoneInfo(tz_name)
@@ -261,17 +319,26 @@ def api_run_scheduler():
             continue
 
         now = datetime.now(tz)
-        weekday = now.weekday()
+        weekday = now.weekday()  # 0=Mon, 6=Sun
         current_time = now.strftime("%H:%M")
 
-        if weekday >= 5:
-            desired = "PAUSED"
-        elif weekday == 4 and current_time >= pause_time_str:
-            desired = "PAUSED"
-        elif weekday == 0 and current_time < resume_time_str:
-            desired = "PAUSED"
+        if "hours" in rule:
+            # New hours-grid model
+            day_key = DAY_KEYS[weekday]
+            active_hours = rule["hours"].get(day_key, [])
+            desired = "ACTIVE" if now.hour in active_hours else "PAUSED"
         else:
-            desired = "ACTIVE"
+            # Legacy resume_time/pause_time model
+            resume_time_str = rule.get("resume_time", "06:00")
+            pause_time_str = rule.get("pause_time", "18:00")
+            if weekday >= 5:
+                desired = "PAUSED"
+            elif weekday == 4 and current_time >= pause_time_str:
+                desired = "PAUSED"
+            elif weekday == 0 and current_time < resume_time_str:
+                desired = "PAUSED"
+            else:
+                desired = "ACTIVE"
 
         body = {"patch": {"$set": {"status": desired}}}
         extra_headers = {"X-RestLi-Method": "PARTIAL_UPDATE"}
