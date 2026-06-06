@@ -7,6 +7,7 @@ pause/resume campaigns, and trigger the scheduler manually.
 Reuses API helpers from linkedin_ads_server.py — no duplicated logic.
 """
 
+import json
 import logging
 import os
 import sys
@@ -545,12 +546,12 @@ HISTORY_FILE = os.path.join(
 
 def _load_history():
     """Load run history from disk."""
-    if os.path.exists(HISTORY_FILE):
-        try:
+    try:
+        if os.path.exists(HISTORY_FILE):
             with open(HISTORY_FILE, "r") as f:
                 return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
+    except Exception:
+        pass
     return []
 
 
@@ -558,9 +559,10 @@ def _save_history(history):
     """Persist run history to disk (capped at MAX_HISTORY)."""
     history = history[-MAX_HISTORY:]
     try:
+        os.makedirs(os.path.dirname(HISTORY_FILE) or ".", exist_ok=True)
         with open(HISTORY_FILE, "w") as f:
             json.dump(history, f, indent=2)
-    except IOError as e:
+    except Exception as e:
         logger.warning("Could not save history: %s", e)
 
 
@@ -589,9 +591,12 @@ def api_scheduler_status():
 @requires_auth
 def api_scheduler_history():
     """Return scheduler run history (most recent first)."""
-    history = _load_history()
-    history.reverse()
-    return jsonify(history)
+    try:
+        history = _load_history()
+        history.reverse()
+        return jsonify(history)
+    except Exception as e:
+        return jsonify([])
 
 
 def _run_scheduler_tick(trigger="auto"):
