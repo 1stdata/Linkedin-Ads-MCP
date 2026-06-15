@@ -733,10 +733,10 @@ def _generate_weekly_report(account_id=None):
         _save_weekly_reports(reports)
         return report_entry
 
-    # Fetch analytics for the week (end date is exclusive, so use this_monday)
+    # Fetch analytics for the week (end date is inclusive)
     date_range = (
         f"(start:(year:{last_monday.year},month:{last_monday.month},day:{last_monday.day}),"
-        f"end:(year:{this_monday.year},month:{this_monday.month},day:{this_monday.day}))"
+        f"end:(year:{last_sunday.year},month:{last_sunday.month},day:{last_sunday.day}))"
     )
     encoded_urn = f"urn%3Ali%3AsponsoredAccount%3A{account_id}"
     qs = (
