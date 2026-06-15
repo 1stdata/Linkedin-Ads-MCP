@@ -717,6 +717,7 @@ def _generate_weekly_report(account_id=None):
         if el.get("status") == "ACTIVE":
             cid = extract_id_from_urn(el.get("id", "")) or str(el.get("id", ""))
             active_campaigns[cid] = el.get("name", f"Campaign {cid}")
+    logger.info("Weekly report: account=%s, %d active campaigns: %s", account_id, len(active_campaigns), list(active_campaigns.keys()))
 
     if not active_campaigns:
         report_text = _format_weekly_report(last_monday, last_sunday, {}, {})
@@ -746,7 +747,9 @@ def _generate_weekly_report(account_id=None):
     )
     full_url = f"https://api.linkedin.com/rest/adAnalytics?{qs}"
 
+    logger.info("Weekly report analytics URL: %s", full_url)
     data = linkedin_api_request("GET", full_url)
+    logger.info("Weekly report analytics response keys: %s, elements count: %d", list(data.keys()), len(data.get("elements", [])))
     if "error" in data:
         raise RuntimeError(f"Analytics API error: {data['error']}")
 
@@ -757,6 +760,7 @@ def _generate_weekly_report(account_id=None):
         pivot_value = pivot_values[0] if pivot_values else el.get("pivotValue", "")
         cid = extract_id_from_urn(pivot_value) if pivot_value else ""
         if not cid or cid not in active_campaigns:
+            logger.debug("Weekly report: skipping analytics element pivot=%s cid=%s (not in active)", pivot_value, cid)
             continue
         campaign_analytics[cid] = {
             "spend": float(el.get("costInLocalCurrency", 0)),
