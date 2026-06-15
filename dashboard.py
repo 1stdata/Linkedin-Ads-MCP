@@ -16,6 +16,8 @@ import time
 from datetime import datetime, timedelta
 from functools import wraps
 
+import requests as requests_lib
+
 from flask import Flask, jsonify, render_template, request, Response
 
 # ---------------------------------------------------------------------------
@@ -48,6 +50,12 @@ get_credentials = li.get_credentials
 _load_schedules = li._load_schedules
 _save_schedules = li._save_schedules
 LINKEDIN_BUSINESS_ACCOUNT_ID = li.LINKEDIN_BUSINESS_ACCOUNT_ID
+
+# Weekly report configuration
+WEEKLY_REPORT_ACCOUNT_ID = os.environ.get("WEEKLY_REPORT_ACCOUNT_ID", LINKEDIN_BUSINESS_ACCOUNT_ID)
+WEEKLY_REPORT_ENABLED = os.environ.get("WEEKLY_REPORT_ENABLED", "false").lower() == "true"
+WEEKLY_REPORT_SLACK_WEBHOOK = os.environ.get("WEEKLY_REPORT_SLACK_WEBHOOK", "")
+WEEKLY_REPORT_TIMEZONE = os.environ.get("WEEKLY_REPORT_TIMEZONE", "America/New_York")
 
 # ---------------------------------------------------------------------------
 # Flask app
@@ -542,6 +550,11 @@ HISTORY_FILE = os.path.join(
     "/data" if os.environ.get("RAILWAY_ENVIRONMENT") else os.path.dirname(os.path.abspath(__file__)),
     "scheduler_history.json",
 )
+MAX_WEEKLY_REPORTS = 12
+WEEKLY_REPORTS_FILE = os.path.join(
+    "/data" if os.environ.get("RAILWAY_ENVIRONMENT") else os.path.dirname(os.path.abspath(__file__)),
+    "weekly_reports.json",
+)
 
 
 def _load_history():
@@ -580,6 +593,240 @@ def _record_run(trigger, actions):
     return entry
 
 
+# ---------------------------------------------------------------------------
+# Weekly report persistence
+# ---------------------------------------------------------------------------
+
+def _load_weekly_reports():
+    """Load weekly reports from disk."""
+    try:
+        if os.path.exists(WEEKLY_REPORTS_FILE):
+            with open(WEEKLY_REPORTS_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def _save_weekly_reports(reports):
+    """Persist weekly reports to disk (capped at MAX_WEEKLY_REPORTS)."""
+    reports = reports[-MAX_WEEKLY_REPORTS:]
+    try:
+        os.makedirs(os.path.dirname(WEEKLY_REPORTS_FILE) or ".", exist_ok=True)
+        with open(WEEKLY_REPORTS_FILE, "w") as f:
+            json.dump(reports, f, indent=2)
+    except Exception as e:
+        logger.warning("Could not save weekly reports: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Weekly report generation
+# ---------------------------------------------------------------------------
+
+def _format_weekly_report(week_start, week_end, campaigns, analytics):
+    """Format the weekly report as Slack-friendly bullet points."""
+    start_str = f"{week_start.strftime('%b')} {week_start.day}"
+    end_str = f"{week_end.strftime('%b')} {week_end.day}, {week_end.year}"
+
+    lines = []
+    lines.append("*InnoVint LinkedIn Ads -- Weekly Performance Summary*")
+    lines.append(f"_Week of {start_str} - {end_str}_")
+    lines.append("")
+
+    # Calculate totals
+    total_spend = sum(a["spend"] for a in analytics.values())
+    total_impressions = sum(a["impressions"] for a in analytics.values())
+    total_clicks = sum(a["clicks"] for a in analytics.values())
+    total_leads = sum(a["leads"] for a in analytics.values())
+    total_conversions = sum(a["conversions"] for a in analytics.values())
+    ctr = (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
+    avg_cpc = (total_spend / total_clicks) if total_clicks > 0 else 0
+
+    lines.append("*Totals*")
+    lines.append(f"- Total Spend: ${total_spend:,.2f}")
+    lines.append(f"- Impressions: {total_impressions:,}")
+    lines.append(f"- Clicks: {total_clicks:,}")
+    lines.append(f"- CTR: {ctr:.2f}%")
+    lines.append(f"- Avg CPC: ${avg_cpc:.2f}")
+    lines.append(f"- Leads: {total_leads:,}")
+    lines.append(f"- Conversions: {total_conversions:,}")
+    lines.append("")
+
+    # Campaign breakdown
+    if campaigns:
+        lines.append("*Campaign Breakdown*")
+        lines.append("")
+        for cid, name in campaigns.items():
+            a = analytics.get(cid, {})
+            spend = a.get("spend", 0)
+            impr = a.get("impressions", 0)
+            clicks = a.get("clicks", 0)
+            leads = a.get("leads", 0)
+            convs = a.get("conversions", 0)
+            c_ctr = (clicks / impr * 100) if impr > 0 else 0
+            c_cpc = (spend / clicks) if clicks > 0 else 0
+
+            lines.append(f"*{name}*")
+            parts = [
+                f"Spend: ${spend:,.2f}",
+                f"Impr: {impr:,}",
+                f"Clicks: {clicks:,}",
+                f"CTR: {c_ctr:.2f}%",
+                f"CPC: ${c_cpc:.2f}",
+            ]
+            if leads > 0:
+                parts.append(f"{leads} lead{'s' if leads != 1 else ''}")
+            if convs > 0:
+                parts.append(f"{convs} conversion{'s' if convs != 1 else ''}")
+            lines.append(" | ".join(parts))
+            lines.append("")
+
+    # Weekend pausing note
+    lines.append("*Weekend Pausing*")
+    lines.append("We are pausing LinkedIn ads on weekends to conserve budget and focus spend on weekdays when engagement is higher.")
+
+    return "\n".join(lines)
+
+
+def _generate_weekly_report(account_id=None):
+    """Generate the weekly LinkedIn ads performance report."""
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+
+    account_id = account_id or WEEKLY_REPORT_ACCOUNT_ID
+    if not account_id:
+        raise ValueError("No account ID configured for weekly report")
+
+    tz = ZoneInfo(WEEKLY_REPORT_TIMEZONE)
+    now = datetime.now(tz)
+
+    # Calculate previous Mon-Sun
+    this_monday = now.date() - timedelta(days=now.weekday())
+    last_monday = this_monday - timedelta(days=7)
+    last_sunday = this_monday - timedelta(days=1)
+
+    # Fetch ACTIVE campaigns
+    elements = linkedin_paginated_request(
+        f"/adAccounts/{account_id}/adCampaigns",
+        params={"q": "search"},
+    )
+    active_campaigns = {}
+    for el in elements:
+        if el.get("status") == "ACTIVE":
+            cid = extract_id_from_urn(el.get("id", "")) or str(el.get("id", ""))
+            active_campaigns[cid] = el.get("name", f"Campaign {cid}")
+
+    if not active_campaigns:
+        report_text = _format_weekly_report(last_monday, last_sunday, {}, {})
+        report_entry = {
+            "generated_at": now.isoformat(timespec="seconds"),
+            "week_start": last_monday.isoformat(),
+            "week_end": last_sunday.isoformat(),
+            "account_id": account_id,
+            "report_text": report_text,
+        }
+        reports = _load_weekly_reports()
+        reports.append(report_entry)
+        _save_weekly_reports(reports)
+        return report_entry
+
+    # Fetch analytics for the week (end date is exclusive, so use this_monday)
+    date_range = (
+        f"(start:(year:{last_monday.year},month:{last_monday.month},day:{last_monday.day}),"
+        f"end:(year:{this_monday.year},month:{this_monday.month},day:{this_monday.day}))"
+    )
+    encoded_urn = f"urn%3Ali%3AsponsoredAccount%3A{account_id}"
+    qs = (
+        f"q=analytics&pivot=CAMPAIGN&timeGranularity=ALL"
+        f"&accounts=List({encoded_urn})"
+        f"&dateRange={date_range}"
+        f"&fields=costInLocalCurrency,impressions,clicks,oneClickLeads,externalWebsiteConversions,pivotValues,dateRange"
+    )
+    full_url = f"https://api.linkedin.com/rest/adAnalytics?{qs}"
+
+    data = linkedin_api_request("GET", full_url)
+    if "error" in data:
+        raise RuntimeError(f"Analytics API error: {data['error']}")
+
+    # Parse analytics per campaign (only active ones)
+    campaign_analytics = {}
+    for el in data.get("elements", []):
+        pivot_values = el.get("pivotValues", [])
+        pivot_value = pivot_values[0] if pivot_values else el.get("pivotValue", "")
+        cid = extract_id_from_urn(pivot_value) if pivot_value else ""
+        if not cid or cid not in active_campaigns:
+            continue
+        campaign_analytics[cid] = {
+            "spend": float(el.get("costInLocalCurrency", 0)),
+            "impressions": int(el.get("impressions", 0)),
+            "clicks": int(el.get("clicks", 0)),
+            "leads": int(el.get("oneClickLeads", 0)),
+            "conversions": int(el.get("externalWebsiteConversions", 0)),
+        }
+
+    report_text = _format_weekly_report(last_monday, last_sunday, active_campaigns, campaign_analytics)
+
+    report_entry = {
+        "generated_at": now.isoformat(timespec="seconds"),
+        "week_start": last_monday.isoformat(),
+        "week_end": last_sunday.isoformat(),
+        "account_id": account_id,
+        "report_text": report_text,
+    }
+
+    reports = _load_weekly_reports()
+    reports.append(report_entry)
+    _save_weekly_reports(reports)
+
+    # Optionally post to Slack webhook
+    if WEEKLY_REPORT_SLACK_WEBHOOK:
+        try:
+            requests_lib.post(
+                WEEKLY_REPORT_SLACK_WEBHOOK,
+                json={"text": report_text},
+                timeout=10,
+            )
+            logger.info("Weekly report posted to Slack webhook.")
+        except Exception as e:
+            logger.warning("Failed to post weekly report to Slack: %s", e)
+
+    return report_entry
+
+
+def _check_weekly_report():
+    """Check if it's time to auto-generate the weekly report (Monday 8:00-8:29 AM)."""
+    if not WEEKLY_REPORT_ENABLED:
+        return
+
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(WEEKLY_REPORT_TIMEZONE)
+    now = datetime.now(tz)
+
+    # Only on Monday between 8:00 and 8:29
+    if now.weekday() != 0 or now.hour != 8 or now.minute >= 30:
+        return
+
+    # Idempotency: check last report date
+    reports = _load_weekly_reports()
+    if reports:
+        last_generated = reports[-1].get("generated_at", "")
+        if last_generated.startswith(now.date().isoformat()):
+            return
+
+    logger.info("Auto-generating weekly report...")
+    try:
+        _generate_weekly_report()
+        logger.info("Weekly report auto-generated successfully.")
+    except Exception as e:
+        logger.exception("Failed to auto-generate weekly report: %s", e)
+
+
 @app.route("/api/scheduler/status")
 @requires_auth
 def api_scheduler_status():
@@ -597,6 +844,42 @@ def api_scheduler_history():
         return jsonify(history)
     except Exception as e:
         return jsonify([])
+
+
+# ---------------------------------------------------------------------------
+# Weekly report API routes
+# ---------------------------------------------------------------------------
+
+@app.route("/api/weekly-reports")
+@requires_auth
+def api_weekly_reports():
+    """List all weekly reports (most recent first)."""
+    reports = _load_weekly_reports()
+    reports.reverse()
+    return jsonify({"reports": reports})
+
+
+@app.route("/api/weekly-reports/generate", methods=["POST"])
+@requires_auth
+def api_weekly_reports_generate():
+    """Manually trigger weekly report generation."""
+    try:
+        account_id = (request.json or {}).get("account_id", WEEKLY_REPORT_ACCOUNT_ID)
+        report = _generate_weekly_report(account_id)
+        return jsonify({"success": True, "report": report})
+    except Exception as e:
+        logger.exception("Failed to generate weekly report: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/weekly-reports/latest")
+@requires_auth
+def api_weekly_reports_latest():
+    """Get the most recent weekly report."""
+    reports = _load_weekly_reports()
+    if not reports:
+        return jsonify({"error": "No reports generated yet"}), 404
+    return jsonify({"report": reports[-1]})
 
 
 def _run_scheduler_tick(trigger="auto"):
@@ -689,6 +972,8 @@ def _scheduler_loop():
         except Exception as e:
             logger.exception("Scheduler tick failed: %s", e)
             _update_next_run()
+        # Check if weekly report needs generating
+        _check_weekly_report()
 
 
 def start_background_scheduler():

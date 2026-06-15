@@ -351,6 +351,31 @@
     </div>
   </div>
 
+  <!-- Weekly Reports -->
+  <div class="section">
+    <div class="section-title">Weekly Reports</div>
+    <div class="scheduler-panel">
+      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:12px">
+        <button class="btn btn-primary" id="generateReportBtn" onclick="generateWeeklyReport()">Generate Report Now</button>
+        <span id="weeklyReportStatus" class="schedule-info" style="font-size:13px"></span>
+      </div>
+      <div id="weeklyReportContent" style="display:none">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <span style="font-size:13px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em">Latest Report</span>
+          <button class="btn btn-sm btn-primary" id="copyReportBtn" onclick="copyReportToClipboard()">Copy to Clipboard</button>
+        </div>
+        <pre id="weeklyReportText" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:16px;font-size:13px;line-height:1.6;white-space:pre-wrap;word-wrap:break-word;max-height:500px;overflow-y:auto;color:var(--text);font-family:inherit"></pre>
+      </div>
+      <div style="margin-top:16px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <span style="font-size:13px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em">Report History</span>
+          <button class="btn btn-sm btn-outline" onclick="loadWeeklyReports()">Refresh</button>
+        </div>
+        <div id="weeklyReportHistory" style="font-size:13px;max-height:300px;overflow-y:auto;color:var(--text-muted)">Loading...</div>
+      </div>
+    </div>
+  </div>
+
   <!-- Scheduler -->
   <div class="section">
     <div class="section-title">Scheduler</div>
@@ -1058,6 +1083,82 @@ async function saveEditCampaign() {
   }
 }
 
+// ---- Weekly Reports ----
+
+let weeklyReports = [];
+
+async function loadWeeklyReports() {
+  const historyEl = document.getElementById("weeklyReportHistory");
+  const contentEl = document.getElementById("weeklyReportContent");
+  const statusEl = document.getElementById("weeklyReportStatus");
+
+  try {
+    const data = await apiFetch("/api/weekly-reports");
+    weeklyReports = data.reports || [];
+
+    if (weeklyReports.length > 0) {
+      const latest = weeklyReports[0];
+      const genDate = new Date(latest.generated_at);
+      statusEl.textContent = "Last generated: " + genDate.toLocaleString("en-US", {
+        timeZone: "America/New_York",
+        month: "short", day: "numeric",
+        hour: "numeric", minute: "2-digit", hour12: true
+      }) + " ET";
+
+      // Show latest report
+      document.getElementById("weeklyReportText").textContent = latest.report_text;
+      contentEl.style.display = "block";
+
+      // Render history
+      historyEl.innerHTML = weeklyReports.map((r, i) => {
+        const isActive = i === 0 ? ' style="color:var(--text)"' : '';
+        return '<div style="padding:8px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="showReport(' + i + ')"' + isActive + '>'
+          + '<strong>Week of ' + esc(r.week_start) + '</strong> — Generated ' + esc(r.generated_at.split("T")[0])
+          + '</div>';
+      }).join("");
+    } else {
+      statusEl.textContent = "No reports generated yet";
+      contentEl.style.display = "none";
+      historyEl.innerHTML = '<span style="color:var(--text-muted)">No reports generated yet.</span>';
+    }
+  } catch (e) {
+    historyEl.innerHTML = '<span style="color:var(--text-muted)">Could not load reports.</span>';
+  }
+}
+
+function showReport(index) {
+  if (weeklyReports[index]) {
+    document.getElementById("weeklyReportText").textContent = weeklyReports[index].report_text;
+    document.getElementById("weeklyReportContent").style.display = "block";
+  }
+}
+
+async function generateWeeklyReport() {
+  const btn = document.getElementById("generateReportBtn");
+  setLoading(btn, true);
+  try {
+    await apiFetch("/api/weekly-reports/generate", { method: "POST", body: JSON.stringify({}) });
+    await loadWeeklyReports();
+  } catch (e) {
+    showError("Failed to generate report: " + e.message);
+  } finally {
+    setLoading(btn, false);
+  }
+}
+
+async function copyReportToClipboard() {
+  const text = document.getElementById("weeklyReportText").textContent;
+  const btn = document.getElementById("copyReportBtn");
+  try {
+    await navigator.clipboard.writeText(text);
+    const origText = btn.textContent;
+    btn.textContent = "Copied!";
+    setTimeout(() => { btn.textContent = origText; }, 2000);
+  } catch (e) {
+    showError("Failed to copy: " + e.message);
+  }
+}
+
 // ---- Scheduler ----
 
 function utcToEastern(utcStr) {
@@ -1158,6 +1259,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   await loadAccounts();
   loadCampaignGroups();
   loadCampaigns();
+  loadWeeklyReports();
   loadSchedulerStatus();
   loadSchedulerHistory();
 });

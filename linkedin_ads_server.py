@@ -110,18 +110,13 @@ def epoch_ms_to_iso(epoch_ms: int) -> str:
 def parse_date_params(start_date: str, end_date: str) -> dict:
     """Parse start/end date strings into LinkedIn analytics date range params.
 
-    Returns a dict with dateRange.start.* and dateRange.end.* query parameters.
+    Returns a dict with a __raw_query key containing the Restli-encoded dateRange
+    that must be appended to the URL without URL-encoding.
     """
     start = datetime.strptime(start_date, "%Y-%m-%d")
     end = datetime.strptime(end_date, "%Y-%m-%d")
-    return {
-        "dateRange.start.day": start.day,
-        "dateRange.start.month": start.month,
-        "dateRange.start.year": start.year,
-        "dateRange.end.day": end.day,
-        "dateRange.end.month": end.month,
-        "dateRange.end.year": end.year,
-    }
+    raw = f"dateRange=(start:(year:{start.year},month:{start.month},day:{start.day}),end:(year:{end.year},month:{end.month},day:{end.day}))"
+    return {"__raw_query": raw}
 
 # ---------------------------------------------------------------------------
 # Auth layer
@@ -262,7 +257,22 @@ def linkedin_api_request(
     if extra_headers:
         headers.update(extra_headers)
 
-    resp = requests.request(method, url, headers=headers, params=params, json=json_body)
+    # Handle raw query params that must not be URL-encoded (Restli format)
+    # Use pop on a copy so the caller's dict retains __raw_query for pagination
+    raw_query = ""
+    if params and "__raw_query" in params:
+        params = dict(params)
+        raw_query = params.pop("__raw_query")
+
+    if raw_query:
+        # Build URL manually: let requests encode the normal params first via PreparedRequest
+        req = requests.Request(method, url, headers=headers, params=params, json=json_body)
+        prepared = req.prepare()
+        separator = "&" if "?" in prepared.url else "?"
+        prepared.url = f"{prepared.url}{separator}{raw_query}"
+        resp = requests.Session().send(prepared)
+    else:
+        resp = requests.request(method, url, headers=headers, params=params, json=json_body)
 
     # Auto-retry on 401 (token may have just expired)
     if resp.status_code == 401:
@@ -270,7 +280,14 @@ def linkedin_api_request(
         try:
             new_token = get_credentials()
             headers["Authorization"] = f"Bearer {new_token}"
-            resp = requests.request(method, url, headers=headers, params=params, json=json_body)
+            if raw_query:
+                req = requests.Request(method, url, headers=headers, params=params, json=json_body)
+                prepared = req.prepare()
+                separator = "&" if "?" in prepared.url else "?"
+                prepared.url = f"{prepared.url}{separator}{raw_query}"
+                resp = requests.Session().send(prepared)
+            else:
+                resp = requests.request(method, url, headers=headers, params=params, json=json_body)
         except Exception as e:
             logger.error(f"Token refresh failed: {e}")
 
@@ -302,6 +319,7 @@ def linkedin_paginated_request(
     params: Optional[dict] = None,
     max_results: int = 200,
     access_token: Optional[str] = None,
+    extra_headers: Optional[dict] = None,
 ) -> list:
     """Handle LinkedIn start/count pagination and return aggregated elements."""
     params = dict(params or {})
@@ -311,7 +329,7 @@ def linkedin_paginated_request(
     all_elements: list = []
 
     while len(all_elements) < max_results:
-        data = linkedin_api_request("GET", path, params=params, access_token=access_token)
+        data = linkedin_api_request("GET", path, params=params, access_token=access_token, extra_headers=extra_headers)
         if "error" in data:
             raise RuntimeError(f"API error: {data['error']}")
         elements = data.get("elements", [])
@@ -393,7 +411,7 @@ async def list_accounts(
     try:
         params = {
             "q": "search",
-            "search": "(status:(values:List(ACTIVE,DRAFT,CANCELED)))",
+            "__raw_query": "search=(status:(values:List(ACTIVE,DRAFT,CANCELED)))",
         }
         elements = linkedin_paginated_request("/adAccounts", params=params)
 
@@ -474,15 +492,17 @@ async def list_campaign_groups(
         A formatted list of campaign groups.
     """
     try:
-        params: dict = {
-            "q": "search",
-            "search": f"(account:(values:List({format_account_urn(account_id)})))",
-        }
+        acct_urn = format_account_urn(account_id).replace(":", "%3A")
+        search_expr = f"(account:(values:List({acct_urn})))"
         if status_filter:
             statuses = ",".join(s.strip() for s in status_filter.split(","))
-            params["search"] = f"(account:(values:List({format_account_urn(account_id)})),status:(values:List({statuses})))"
+            search_expr = f"(account:(values:List({acct_urn})),status:(values:List({statuses})))"
+        params: dict = {
+            "q": "search",
+            "__raw_query": f"search={search_expr}",
+        }
 
-        elements = linkedin_paginated_request(f"/adAccounts/{account_id}/adCampaignGroups", params=params)
+        elements = linkedin_paginated_request("/adCampaignGroups", params=params)
 
         if not elements:
             return "No campaign groups found."
@@ -655,19 +675,22 @@ async def list_campaigns(
         A formatted list of campaigns with key details.
     """
     try:
-        search_parts = [f"account:(values:List({format_account_urn(account_id)}))"]
+        acct_urn = format_account_urn(account_id).replace(":", "%3A")
+        search_parts = [f"account:(values:List({acct_urn}))"]
         if status_filter:
             statuses = ",".join(s.strip() for s in status_filter.split(","))
             search_parts.append(f"status:(values:List({statuses}))")
         if campaign_group_id:
-            search_parts.append(f"campaignGroup:(values:List({format_campaign_group_urn(account_id, campaign_group_id)}))")
+            grp_urn = format_campaign_group_urn(account_id, campaign_group_id).replace(":", "%3A")
+            search_parts.append(f"campaignGroup:(values:List({grp_urn}))")
 
+        search_expr = "(" + ",".join(search_parts) + ")"
         params = {
             "q": "search",
-            "search": "(" + ",".join(search_parts) + ")",
+            "__raw_query": f"search={search_expr}",
         }
 
-        elements = linkedin_paginated_request(f"/adAccounts/{account_id}/adCampaigns", params=params)
+        elements = linkedin_paginated_request("/adCampaigns", params=params)
 
         if not elements:
             return "No campaigns found."
@@ -1038,16 +1061,15 @@ async def list_creatives(
     """
     try:
         params: dict = {"q": "criteria"}
-        search_parts = []
+        raw_parts = []
         if campaign_id:
-            search_parts.append(f"campaigns:List({format_campaign_urn(campaign_id)})")
+            cam_urn = format_campaign_urn(campaign_id).replace(":", "%3A")
+            raw_parts.append(f"campaigns=List({cam_urn})")
         if status_filter:
             statuses = ",".join(s.strip() for s in status_filter.split(","))
-            search_parts.append(f"status:List({statuses})")
-        if search_parts:
-            for part in search_parts:
-                key, val = part.split(":", 1)
-                params[key] = val
+            raw_parts.append(f"status=List({statuses})")
+        if raw_parts:
+            params["__raw_query"] = "&".join(raw_parts)
 
         elements = linkedin_paginated_request(f"/adAccounts/{account_id}/creatives", params=params)
 
@@ -1181,29 +1203,40 @@ def _build_analytics_params(
     campaign_group_ids: Optional[List[str]] = None,
     creative_ids: Optional[List[str]] = None,
 ) -> dict:
-    """Build query params for the /adAnalytics endpoint."""
+    """Build query params for the /adAnalytics endpoint.
+
+    Restli-encoded params (dateRange, List() filters) are collected into
+    __raw_query so they can be appended to the URL without URL-encoding.
+    """
     params: dict = {
         "q": "analytics",
         "pivot": pivot,
         "timeGranularity": time_granularity.upper(),
     }
 
+    # Collect Restli-encoded fragments that must not be URL-encoded
+    raw_parts: list = []
+
     # Date range
-    params.update(parse_date_params(start_date, end_date))
+    date_params = parse_date_params(start_date, end_date)
+    raw_parts.append(date_params["__raw_query"])
+
+    # Account scope — colons in URNs must be percent-encoded
+    acct_urn = format_account_urn(account_id).replace(":", "%3A")
+    raw_parts.append(f"accounts=List({acct_urn})")
 
     # Entity filters
     if campaign_ids:
-        urns = ",".join(format_campaign_urn(c) for c in campaign_ids)
-        params["campaigns"] = f"List({urns})"
+        urns = ",".join(format_campaign_urn(c).replace(":", "%3A") for c in campaign_ids)
+        raw_parts.append(f"campaigns=List({urns})")
     if campaign_group_ids:
-        urns = ",".join(format_campaign_group_urn(account_id, g) for g in campaign_group_ids)
-        params["campaignGroups"] = f"List({urns})"
+        urns = ",".join(format_campaign_group_urn(account_id, g).replace(":", "%3A") for g in campaign_group_ids)
+        raw_parts.append(f"campaignGroups=List({urns})")
     if creative_ids:
-        urns = ",".join(format_creative_urn(c) for c in creative_ids)
-        params["creatives"] = f"List({urns})"
+        urns = ",".join(format_creative_urn(c).replace(":", "%3A") for c in creative_ids)
+        raw_parts.append(f"creatives=List({urns})")
 
-    # Account scope
-    params["accounts"] = f"List({format_account_urn(account_id)})"
+    params["__raw_query"] = "&".join(raw_parts)
 
     return params
 
@@ -1216,8 +1249,11 @@ def _format_analytics_results(elements: list, pivot: str, format_type: str = "ta
     rows = []
     for el in elements:
         row: dict = {}
-        # Pivot value
+        # Pivot value — newer API versions use pivotValues (array)
         pivot_val = el.get("pivotValue", el.get("pivot", ""))
+        if not pivot_val:
+            pv_list = el.get("pivotValues", [])
+            pivot_val = pv_list[0] if pv_list else ""
         if isinstance(pivot_val, str) and "urn:" in pivot_val:
             pivot_val = extract_id_from_urn(pivot_val)
         row["pivotValue"] = pivot_val
@@ -2139,6 +2175,9 @@ async def get_conversion_performance(
         rows = []
         for el in elements:
             pivot_val = el.get("pivotValue", "")
+            if not pivot_val:
+                pv_list = el.get("pivotValues", [])
+                pivot_val = pv_list[0] if pv_list else ""
             if isinstance(pivot_val, str) and "urn:" in pivot_val:
                 pivot_val = extract_id_from_urn(pivot_val)
 
@@ -2206,6 +2245,9 @@ async def get_lead_gen_performance(
         rows = []
         for el in elements:
             pivot_val = el.get("pivotValue", "")
+            if not pivot_val:
+                pv_list = el.get("pivotValues", [])
+                pivot_val = pv_list[0] if pv_list else ""
             if isinstance(pivot_val, str) and "urn:" in pivot_val:
                 pivot_val = extract_id_from_urn(pivot_val)
 

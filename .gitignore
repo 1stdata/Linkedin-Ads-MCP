@@ -55,5 +55,6 @@ google_ads_token.json
 linkedin_token.json
 schedules.json
 scheduler_history.json
+weekly_reports.json
 
 uv.lock
