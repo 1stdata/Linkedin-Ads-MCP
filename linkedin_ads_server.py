@@ -1238,6 +1238,14 @@ def _build_analytics_params(
 
     params["__raw_query"] = "&".join(raw_parts)
 
+    # Explicitly request cost, engagement, and conversion fields
+    raw_parts_fields = (
+        "fields=costInLocalCurrency,impressions,clicks,landingPageClicks,"
+        "likes,shares,comments,externalWebsiteConversions,oneClickLeads,"
+        "approximateUniqueImpressions,pivotValues,dateRange"
+    )
+    params["__raw_query"] += "&" + raw_parts_fields
+
     return params
 
 
@@ -1276,7 +1284,8 @@ def _format_analytics_results(elements: list, pivot: str, format_type: str = "ta
         row["likes"] = el.get("likes", 0)
         row["shares"] = el.get("shares", 0)
         row["comments"] = el.get("comments", 0)
-        row["conversions"] = el.get("conversions", 0)
+        row["conversions"] = el.get("externalWebsiteConversions", el.get("conversions", 0))
+        row["leads"] = el.get("oneClickLeads", 0)
         row["approximateUniqueImpressions"] = el.get("approximateUniqueImpressions", 0)
         rows.append(row)
 
