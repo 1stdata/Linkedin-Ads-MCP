@@ -1674,13 +1674,10 @@ async def get_targeting_entities(
         query: "software engineer"
     """
     try:
-        params: dict = {
-            "q": "adTargetingFacet",
-            "adTargetingFacet": facet_urn,
-            "count": limit,
-        }
         if query:
-            params["query"] = query
+            params: dict = {"q": "typeahead", "facet": facet_urn, "query": query, "count": limit}
+        else:
+            params = {"q": "adTargetingFacet", "facet": facet_urn, "count": limit}
 
         data = linkedin_api_request("GET", "/adTargetingEntities", params=params)
         if "error" in data:
