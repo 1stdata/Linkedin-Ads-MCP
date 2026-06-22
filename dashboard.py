@@ -994,6 +994,65 @@ start_background_scheduler()
 # Main
 # ---------------------------------------------------------------------------
 
+
+
+@app.route("/health")
+def health():
+    """Verify env vars + token validity + granted scopes (for Railway sanity check)."""
+    keys = [
+        "LINKEDIN_CLIENT_ID", "LINKEDIN_CLIENT_SECRET", "LINKEDIN_ACCESS_TOKEN",
+        "LINKEDIN_REFRESH_TOKEN", "LINKEDIN_ORG_URN", "LINKEDIN_API_VERSION",
+        "LINKEDIN_OAUTH_SCOPES", "LINKEDIN_BUSINESS_ACCOUNT_ID",
+    ]
+    env_present = {k: bool(os.environ.get(k)) for k in keys}
+    result = {"env_present": env_present}
+
+    try:
+        token = li.get_credentials()
+    except Exception as e:
+        result["token"] = f"ERROR: {e}"
+        result["READY"] = False
+        return jsonify(result), 500
+
+    # Introspect the token to read its real granted scopes
+    try:
+        ir = requests_lib.post(
+            "https://www.linkedin.com/oauth/v2/introspectToken",
+            data={
+                "client_id": os.environ.get("LINKEDIN_CLIENT_ID", ""),
+                "client_secret": os.environ.get("LINKEDIN_CLIENT_SECRET", ""),
+                "token": token,
+            },
+            timeout=20,
+        )
+        ij = ir.json()
+        scopes = ij.get("scope", "")
+        result["token_active"] = ij.get("active")
+        result["scopes"] = scopes
+        result["has_w_organization_social"] = "w_organization_social" in scopes
+        result["has_rw_ads"] = "rw_ads" in scopes
+    except Exception as e:
+        result["introspect_error"] = str(e)
+        scopes = ""
+
+    # Quick API reachability check
+    try:
+        r = requests_lib.get(
+            "https://api.linkedin.com/rest/adAccounts",
+            headers=li.get_headers(token), params={"q": "search"}, timeout=20,
+        )
+        result["adAccounts_status"] = r.status_code
+    except Exception as e:
+        result["adAccounts_error"] = str(e)
+
+    required = ["LINKEDIN_CLIENT_ID", "LINKEDIN_CLIENT_SECRET", "LINKEDIN_ACCESS_TOKEN",
+                "LINKEDIN_REFRESH_TOKEN", "LINKEDIN_ORG_URN"]
+    result["READY"] = bool(all(env_present[k] for k in required)
+                           and result.get("has_w_organization_social")
+                           and result.get("has_rw_ads"))
+    return jsonify(result)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
     app.run(host="0.0.0.0", port=port, debug=True)
