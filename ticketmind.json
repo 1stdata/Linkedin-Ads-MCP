@@ -1,0 +1,41 @@
+{
+  "account_id": "513217390",
+  "group": { "name": "TicketMind", "status": "ACTIVE" },
+  "campaign": {
+    "name": "TicketMind — Core Prospecting",
+    "objective": "LEAD_GENERATION",
+    "type": "SPONSORED_UPDATES",
+    "cost_type": "CPM",
+    "status": "DRAFT",
+    "daily_budget": "175",
+    "currency": "USD",
+    "locale": { "country": "US", "language": "en" }
+  },
+  "targeting": {
+    "geos": ["United States", "Canada"],
+    "company_sizes": ["201-500", "501-1,000", "1,001-5,000", "5,001-10,000"],
+    "industries": [
+      "Software Development", "IT Services and IT Consulting",
+      "Computer and Network Security", "Telecommunications",
+      "Technology, Information and Internet", "Computer Networking Products",
+      "Financial Services", "Data Infrastructure and Analytics",
+      "Cloud Computing", "Internet of Things", "Hospitals and Health Care",
+      "Internet Marketplace Platforms", "Managed Services"
+    ],
+    "titles": [
+      "VP Support", "VP Technical Support", "VP Customer Support", "SVP Support",
+      "SVP Customer Support", "Head of Support", "Head of Technical Support",
+      "Head of Customer Support", "Senior Director of Support", "Director of Support",
+      "Director of Support Operations", "Director Customer Support",
+      "Technical Support Manager", "Global Support Leader",
+      "VP Service Delivery", "Director Service Delivery", "Head of Service Delivery",
+      "VP IT Service Management", "Director IT Service Management", "Head of IT Support",
+      "Director IT Support", "VP Technical Operations", "Director Technical Operations",
+      "VP Customer Engineering", "Director Customer Engineering", "Head of Customer Engineering",
+      "Director Solutions Support", "Director Escalation Management",
+      "Support Engineering Leader", "Technical Services Leader", "VP Technical Services",
+      "Chief Customer Officer", "VP Customer Experience", "Director Customer Experience"
+    ]
+  },
+  "ads": []
+}

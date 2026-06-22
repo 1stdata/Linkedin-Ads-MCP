@@ -83,6 +83,32 @@ def _created_urn(resp: requests.Response) -> str:
     return resp.headers.get("x-restli-id", resp.headers.get("X-RestLi-Id", ""))
 
 
+try:
+    from PIL import Image as _PILImage
+except Exception:
+    _PILImage = None
+
+
+def _prepare_image(path: str, max_dim: int = 1500, target_kb: int = 450) -> str:
+    """Downscale/compress large images so uploads are fast. Returns a file path.
+
+    LinkedIn displays ads small, so a ~1500px JPEG is plenty and uploads in
+    seconds even on a slow connection. Falls back to the original if Pillow is
+    missing or anything goes wrong.
+    """
+    try:
+        if _PILImage is None or os.path.getsize(path) <= target_kb * 1024:
+            return path
+        import tempfile
+        im = _PILImage.open(path).convert("RGB")
+        im.thumbnail((max_dim, max_dim))
+        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        im.save(tmp.name, "JPEG", quality=85, optimize=True)
+        return tmp.name
+    except Exception:
+        return path
+
+
 def _get(path: str, params: Optional[dict] = None, token: Optional[str] = None) -> dict:
     resp = requests.get(f"{API_BASE}{path}", headers=_headers(token), params=params or {}, timeout=30)
     if resp.status_code >= 400:
@@ -178,8 +204,9 @@ def upload_image(image_path: str, owner_urn: Optional[str] = None,
     if not upload_url or not image_urn:
         raise RuntimeError(f"initializeUpload returned no uploadUrl/image: {init.text}")
 
-    # 1b. PUT the binary (only the bearer token on this request)
-    with open(image_path, "rb") as f:
+    # 1b. PUT the binary (compress first so big PNGs upload fast)
+    upload_path = _prepare_image(image_path)
+    with open(upload_path, "rb") as f:
         data = f.read()
     put = requests.put(upload_url, headers={"Authorization": f"Bearer {token}"}, data=data, timeout=180)
     if put.status_code not in (200, 201):
