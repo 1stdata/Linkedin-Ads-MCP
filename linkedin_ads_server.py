@@ -3306,20 +3306,23 @@ async def list_pages(
     try:
         data = linkedin_api_request(
             "GET", "/organizationAcls",
-            params={"q": "roleAssignee", "role": "ADMINISTRATOR", "state": "APPROVED", "count": 100},
+            params={
+                "q": "roleAssignee", "role": "ADMINISTRATOR", "state": "APPROVED", "count": 100,
+                "__raw_query": "projection=(paging,elements*(role,state,organization~(id,localizedName)))",
+            },
         )
-        if "error" in data:
+        if isinstance(data, dict) and "error" in data:
             return f"Error listing pages: {data['error']}"
         rows = []
         for el in data.get("elements", []):
             org = el.get("organization", "")
-            oid = org.split(":")[-1] if org else ""
-            name = ""
-            if oid:
-                od = linkedin_api_request("GET", f"/organizations/{oid}")
-                if isinstance(od, dict) and "error" not in od:
-                    name = od.get("localizedName", "")
-            rows.append({"name": name, "organization_urn": org, "id": oid, "role": el.get("role", "")})
+            dec = el.get("organization~", {}) or {}
+            rows.append({
+                "name": dec.get("localizedName", ""),
+                "organization_urn": org,
+                "id": org.split(":")[-1] if org else "",
+                "role": el.get("role", ""),
+            })
         if not rows:
             return "No administered Pages found (check the r_organization_admin scope)."
         return format_output(rows, format)
