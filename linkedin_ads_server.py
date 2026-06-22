@@ -3227,5 +3227,259 @@ schedule_campaign(
 """
 
 
+# ---------------------------------------------------------------------------
+# Creative pipeline tools (image upload -> dark post -> single-image ad)
+# Backed by creative_pipeline.py — full single-image ad creation + bulk.
+# ---------------------------------------------------------------------------
+import creative_pipeline as _cp
+
+
+@mcp.tool()
+async def upload_image(
+    image_path: str = Field(description="Local path to the image file to upload"),
+    owner_org_urn: str = Field(default="", description="Organization (Page) URN, e.g. urn:li:organization:123. Defaults to LINKEDIN_ORG_URN."),
+) -> str:
+    """Upload an image to the LinkedIn media library and return its image URN."""
+    try:
+        urn = _cp.upload_image(image_path, owner_org_urn or None)
+        return f"Image uploaded.\nImage URN: {urn}"
+    except Exception as e:
+        return f"Error uploading image: {e}"
+
+
+@mcp.tool()
+async def create_single_image_ad(
+    account_id: str = Field(description="LinkedIn Ad Account ID"),
+    campaign_id: str = Field(description="Campaign (ad set) ID the ad belongs to"),
+    image_path: str = Field(description="Local path to the image file"),
+    intro_text: str = Field(description="Introductory/post text (max ~600 chars)"),
+    headline: str = Field(description="Headline shown under the image (max ~200 chars)"),
+    destination_url: str = Field(description="Landing page URL (https://...)"),
+    call_to_action: str = Field(default="LEARN_MORE", description="CTA: LEARN_MORE, REQUEST_DEMO, SIGN_UP, DOWNLOAD, REGISTER, ..."),
+    owner_org_urn: str = Field(default="", description="Organization (Page) URN. Defaults to LINKEDIN_ORG_URN."),
+    status: str = Field(default="ACTIVE", description="ACTIVE, PAUSED, or DRAFT"),
+) -> str:
+    """Create a complete single-image ad: uploads the image, creates the sponsored post, and creates the ad."""
+    try:
+        out = _cp.create_single_image_ad(
+            account_id, campaign_id, image_path, intro_text, headline,
+            destination_url, call_to_action, owner_org_urn or None, status,
+        )
+        return (
+            "Single-image ad created.\n"
+            f"Creative: {out['creative']}\n"
+            f"Post: {out['post_urn']}\n"
+            f"Image: {out['image_urn']}"
+        )
+    except Exception as e:
+        return f"Error creating single-image ad: {e}"
+
+
+@mcp.tool()
+async def bulk_create_single_image_ads(
+    account_id: str = Field(description="LinkedIn Ad Account ID"),
+    campaign_id: str = Field(description="Campaign (ad set) ID for all ads"),
+    csv_path: str = Field(description="CSV columns: image_path, intro_text, headline, call_to_action, destination_url"),
+    owner_org_urn: str = Field(default="", description="Organization (Page) URN. Defaults to LINKEDIN_ORG_URN."),
+    status: str = Field(default="ACTIVE", description="ACTIVE, PAUSED, or DRAFT"),
+) -> str:
+    """Create many single-image ads from a CSV (one ad per row)."""
+    try:
+        results = _cp.bulk_create_from_csv(account_id, campaign_id, csv_path, owner_org_urn or None, status)
+        ok = sum(1 for r in results if r.get("ok"))
+        lines = [("OK  " if r.get("ok") else "ERR ") + f"row {r['row']}: " + (r.get("creative", "") if r.get("ok") else r.get("error", "")) for r in results]
+        return f"Bulk create: {ok}/{len(results)} ads created.\n" + "\n".join(lines)
+    except Exception as e:
+        return f"Error in bulk create: {e}"
+
+
+
+@mcp.tool()
+async def list_pages(
+    format: str = Field(default="table", description="Output format: table, json, or csv"),
+) -> str:
+    """List the LinkedIn Pages (organizations) you administer, with org URNs.
+
+    Use the returned organization URN as owner_org_urn when creating ads.
+    Requires the r_organization_admin / rw_organization_admin scope.
+    """
+    try:
+        data = linkedin_api_request(
+            "GET", "/organizationAcls",
+            params={"q": "roleAssignee", "role": "ADMINISTRATOR", "state": "APPROVED", "count": 100},
+        )
+        if "error" in data:
+            return f"Error listing pages: {data['error']}"
+        rows = []
+        for el in data.get("elements", []):
+            org = el.get("organization", "")
+            oid = org.split(":")[-1] if org else ""
+            name = ""
+            if oid:
+                od = linkedin_api_request("GET", f"/organizations/{oid}")
+                if isinstance(od, dict) and "error" not in od:
+                    name = od.get("localizedName", "")
+            rows.append({"name": name, "organization_urn": org, "id": oid, "role": el.get("role", "")})
+        if not rows:
+            return "No administered Pages found (check the r_organization_admin scope)."
+        return format_output(rows, format)
+    except Exception as e:
+        return f"Error listing pages: {e}"
+
+
+
+@mcp.tool()
+async def resolve_page_for_account(
+    account_id: str = Field(description="LinkedIn Ad Account ID"),
+) -> str:
+    """Show which Page (organization URN) will own ads created for this ad account.
+
+    Uses account_pages.json / LINKEDIN_ACCOUNT_PAGES, then LINKEDIN_ORG_URN.
+    """
+    try:
+        return f"Account {account_id} -> {_cp.resolve_page_for_account(account_id)}"
+    except Exception as e:
+        return f"{e}"
+
+
+
+@mcp.tool()
+async def set_campaign_targeting(
+    account_id: str = Field(description="LinkedIn Ad Account ID"),
+    campaign_id: str = Field(description="Campaign (ad set) ID to update"),
+    targeting_criteria_json: str = Field(description="Targeting criteria JSON (same shape as estimate_audience_size), e.g. {\"include\":{\"and\":[{\"or\":{\"urn:li:adTargetingFacet:industries\":[\"urn:li:industry:48\"]}}]}}"),
+) -> str:
+    """Write/replace the targeting on a campaign (PATCH targetingCriteria).
+
+    Build the criteria with get_targeting_facets / get_targeting_entities, validate
+    size with estimate_audience_size, then set it here.
+    """
+    try:
+        criteria = json.loads(targeting_criteria_json)
+        body = {"patch": {"$set": {"targetingCriteria": criteria}}}
+        data = linkedin_api_request(
+            "POST", f"/adAccounts/{account_id}/adCampaigns/{campaign_id}",
+            json_body=body, extra_headers={"X-RestLi-Method": "PARTIAL_UPDATE"},
+        )
+        if isinstance(data, dict) and "error" in data:
+            return f"Error setting targeting: {data['error']}"
+        return f"Targeting updated on campaign {campaign_id}."
+    except json.JSONDecodeError as e:
+        return f"Invalid targeting JSON: {e}"
+    except Exception as e:
+        return f"Error setting targeting: {e}"
+
+
+@mcp.tool()
+async def duplicate_ad(
+    account_id: str = Field(description="LinkedIn Ad Account ID"),
+    source_creative_id: str = Field(description="Creative (ad) ID to clone"),
+    target_campaign_id: str = Field(description="Campaign (ad set) ID to create the copy in"),
+    status: str = Field(default="PAUSED", description="ACTIVE, PAUSED, or DRAFT"),
+) -> str:
+    """Duplicate an existing ad (its image + copy) into another campaign / ad set."""
+    try:
+        enc = format_creative_urn(source_creative_id).replace(":", "%3A")
+        src = linkedin_api_request("GET", f"/adAccounts/{account_id}/creatives/{enc}")
+        if isinstance(src, dict) and "error" in src:
+            return f"Error reading source creative: {src['error']}"
+        content = src.get("content", {})
+        if not content.get("reference"):
+            return f"Source creative has no content reference; cannot duplicate. Raw: {src}"
+        body = {
+            "campaign": format_campaign_urn(target_campaign_id),
+            "status": status.upper(),
+            "intendedStatus": status.upper(),
+            "content": content,
+        }
+        data = linkedin_api_request("POST", f"/adAccounts/{account_id}/creatives", json_body=body)
+        if isinstance(data, dict) and "error" in data:
+            return f"Error creating duplicate: {data['error']}"
+        return f"Ad duplicated -> {data.get('_created_id', 'unknown')} in campaign {target_campaign_id} (status {status})."
+    except Exception as e:
+        return f"Error duplicating ad: {e}"
+
+
+
+@mcp.tool()
+async def duplicate_campaign(
+    account_id: str = Field(description="LinkedIn Ad Account ID"),
+    source_campaign_id: str = Field(description="Campaign (ad set) ID to clone"),
+    new_name: str = Field(default="", description="Name for the copy (defaults to '<source> (copy)')"),
+    status: str = Field(default="DRAFT", description="ACTIVE, PAUSED, or DRAFT"),
+) -> str:
+    """Duplicate a campaign — settings, budget, bid and targeting — into the same campaign group."""
+    try:
+        src = linkedin_api_request("GET", f"/adAccounts/{account_id}/adCampaigns/{source_campaign_id}")
+        if isinstance(src, dict) and "error" in src:
+            return f"Error reading source campaign: {src['error']}"
+        copy_fields = [
+            "campaignGroup", "type", "costType", "objectiveType", "locale",
+            "dailyBudget", "totalBudget", "unitCost", "bidStrategy", "pacingStrategy",
+            "runSchedule", "targetingCriteria", "format",
+            "audienceExpansionEnabled", "offsiteDeliveryEnabled",
+        ]
+        body = {"account": format_account_urn(account_id), "status": status.upper()}
+        for fld in copy_fields:
+            if src.get(fld) not in (None, ""):
+                body[fld] = src[fld]
+        body["name"] = new_name or (src.get("name", "Campaign") + " (copy)")
+        data = linkedin_api_request("POST", f"/adAccounts/{account_id}/adCampaigns", json_body=body)
+        if isinstance(data, dict) and "error" in data:
+            return f"Error creating duplicate campaign: {data['error']}"
+        return f"Campaign duplicated -> {data.get('_created_id', 'unknown')} (status {status}). Name: {body['name']}"
+    except Exception as e:
+        return f"Error duplicating campaign: {e}"
+
+
+@mcp.tool()
+async def create_saved_audience(
+    account_id: str = Field(description="LinkedIn Ad Account ID"),
+    name: str = Field(description="Name for the saved audience / targeting template"),
+    targeting_criteria_json: str = Field(description="Targeting criteria JSON (same shape as estimate_audience_size)"),
+) -> str:
+    """Save a reusable targeting template (saved audience) on the account."""
+    try:
+        criteria = json.loads(targeting_criteria_json)
+        body = {"account": format_account_urn(account_id), "name": name, "targetingCriteria": criteria}
+        data = linkedin_api_request("POST", f"/adAccounts/{account_id}/adTargetingTemplates", json_body=body)
+        if isinstance(data, dict) and "error" in data:
+            return f"Error saving audience: {data['error']}"
+        return f"Saved audience created -> {data.get('_created_id', 'unknown')} ('{name}')."
+    except json.JSONDecodeError as e:
+        return f"Invalid targeting JSON: {e}"
+    except Exception as e:
+        return f"Error saving audience: {e}"
+
+
+@mcp.tool()
+async def set_campaign_budget(
+    account_id: str = Field(description="LinkedIn Ad Account ID"),
+    campaign_id: str = Field(description="Campaign (ad set) ID to update"),
+    daily_budget: str = Field(default="", description="New daily budget amount (optional)"),
+    total_budget: str = Field(default="", description="New total/lifetime budget amount (optional)"),
+    currency: str = Field(default="USD", description="Currency code"),
+) -> str:
+    """Update a campaign's daily and/or total (lifetime) budget."""
+    try:
+        s: dict = {}
+        if daily_budget:
+            s["dailyBudget"] = {"amount": daily_budget, "currencyCode": currency}
+        if total_budget:
+            s["totalBudget"] = {"amount": total_budget, "currencyCode": currency}
+        if not s:
+            return "Provide daily_budget and/or total_budget."
+        data = linkedin_api_request(
+            "POST", f"/adAccounts/{account_id}/adCampaigns/{campaign_id}",
+            json_body={"patch": {"$set": s}}, extra_headers={"X-RestLi-Method": "PARTIAL_UPDATE"},
+        )
+        if isinstance(data, dict) and "error" in data:
+            return f"Error setting budget: {data['error']}"
+        return f"Budget updated on campaign {campaign_id}."
+    except Exception as e:
+        return f"Error setting budget: {e}"
+
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
