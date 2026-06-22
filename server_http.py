@@ -73,7 +73,9 @@ async def app(scope, receive, send):
         if path.startswith("/mcp"):
             headers = dict(scope.get("headers") or [])
             auth = headers.get(b"authorization", b"").decode()
-            if not API_KEY or auth != f"Bearer {API_KEY}":
+            from urllib.parse import parse_qs
+            key_q = (parse_qs(scope.get("query_string", b"").decode()).get("key") or [""])[0]
+            if not API_KEY or (auth != f"Bearer {API_KEY}" and key_q != API_KEY):
                 await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
                 return
     await _mcp_app(scope, receive, send)
