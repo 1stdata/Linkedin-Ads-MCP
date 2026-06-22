@@ -949,7 +949,7 @@ async function saveSchedule() {
   try {
     // Remove existing schedule first (ignore 404)
     try {
-      await apiFetch(`/api/schedules/${campaignId}`, { method: "DELETE" });
+      await apiFetch(`/api/schedules/${campaignId}?account_id=${getAccountId()}`, { method: "DELETE" });
     } catch (e) { /* ok if not found */ }
 
     await apiFetch("/api/schedules", {
