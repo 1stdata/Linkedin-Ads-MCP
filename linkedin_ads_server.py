@@ -808,6 +808,8 @@ async def create_campaign(
         body: dict = {
             "account": format_account_urn(account_id),
             "campaignGroup": format_campaign_group_urn(account_id, campaign_group_id),
+            "offsiteDeliveryEnabled": False,
+            "politicalIntent": "NOT_POLITICAL",
             "name": name,
             "objectiveType": objective_type.upper(),
             "type": campaign_type.upper(),
