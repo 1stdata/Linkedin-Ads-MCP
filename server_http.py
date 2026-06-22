@@ -25,6 +25,7 @@ mcp = li.mcp
 try:
     mcp.settings.stateless_http = True
     mcp.settings.json_response = True
+    mcp.settings.transport_security = None  # allow any Host (Railway domain); our key handles auth
 except Exception:
     pass
 
