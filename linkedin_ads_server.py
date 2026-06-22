@@ -118,6 +118,26 @@ def parse_date_params(start_date: str, end_date: str) -> dict:
     raw = f"dateRange=(start:(year:{start.year},month:{start.month},day:{start.day}),end:(year:{end.year},month:{end.month},day:{end.day}))"
     return {"__raw_query": raw}
 
+
+def _targeting_to_restli(obj) -> str:
+    """Convert a targetingCriteria dict/list into a RestLi-2.0 query string.
+
+    e.g. {"include":{"and":[{"or":{"urn:li:adTargetingFacet:locations":["urn:li:geo:1"]}}]}}
+    -> (include:(and:List((or:(urn%3Ali%3AadTargetingFacet%3Alocations:List(urn%3Ali%3Ageo%3A1))))))
+
+    URN keys/values are percent-encoded (safe="") so their own :(), characters
+    are not confused with the RestLi structural tokens. Structural tokens
+    ( ) : , List( are emitted literally. The result is appended to the URL via
+    __raw_query so requests does not re-encode the structure.
+    """
+    from urllib.parse import quote
+    if isinstance(obj, dict):
+        return "(" + ",".join(f"{quote(str(k), safe='')}:{_targeting_to_restli(v)}"
+                              for k, v in obj.items()) + ")"
+    if isinstance(obj, list):
+        return "List(" + ",".join(_targeting_to_restli(x) for x in obj) + ")"
+    return quote(str(obj), safe="")
+
 # ---------------------------------------------------------------------------
 # Auth layer
 # ---------------------------------------------------------------------------
@@ -1674,10 +1694,17 @@ async def get_targeting_entities(
         query: "software engineer"
     """
     try:
+        # queryVersion=QUERY_USES_URNS forces the response into urn/name/facetUrn
+        # fields. Without it, the adTargetingFacet finder defaults to
+        # QUERY_USES_MIXED and returns range facets (staffCountRanges, ageRanges,
+        # seniorities, etc.) only as a legacy {"value":{"string":"urn:..."}} blob,
+        # which is why those facets used to come back as all-N/A.
         if query:
-            params: dict = {"q": "typeahead", "facet": facet_urn, "query": query, "count": limit}
+            params: dict = {"q": "typeahead", "facet": facet_urn, "query": query,
+                            "count": limit, "queryVersion": "QUERY_USES_URNS"}
         else:
-            params = {"q": "adTargetingFacet", "facet": facet_urn, "count": limit}
+            params = {"q": "adTargetingFacet", "facet": facet_urn,
+                      "count": limit, "queryVersion": "QUERY_USES_URNS"}
 
         data = linkedin_api_request("GET", "/adTargetingEntities", params=params)
         if "error" in data:
@@ -1689,10 +1716,18 @@ async def get_targeting_entities(
 
         rows = []
         for entity in elements:
+            urn = entity.get("urn")
+            if not urn:
+                # Legacy QUERY_USES_MIXED shape: {"value": {"string": "urn:..."}}
+                val = entity.get("value")
+                if isinstance(val, dict):
+                    urn = val.get("string") or next(iter(val.values()), None)
+                elif isinstance(val, str):
+                    urn = val
             rows.append({
                 "name": entity.get("name", "N/A"),
-                "urn": entity.get("urn", "N/A"),
-                "facetUrn": entity.get("facetUrn", "N/A"),
+                "urn": urn or "N/A",
+                "facetUrn": entity.get("facetUrn", facet_urn),
             })
 
         output_lines = [f"Targeting Entities for {facet_urn}:"]
@@ -1726,33 +1761,30 @@ async def estimate_audience_size(
     """
     try:
         targeting = json.loads(targeting_criteria_json)
-        params: dict = {
-            "q": "targetingCriteria",
-            "account": format_account_urn(account_id),
-        }
-        # Build the targeting criteria params
-        body = {
-            "targetingCriteria": targeting,
-        }
-
-        data = linkedin_api_request("GET", "/audienceCounts", params={
-            "q": "targetingCriteria",
-            "account": format_account_urn(account_id),
-            "targetingCriteria": json.dumps(targeting),
-        })
+        # /audienceCounts uses the RestLi-2.0 finder q=targetingCriteriaV2 and
+        # expects targetingCriteria as a RestLi-encoded string (NOT JSON, and NO
+        # account param). URN keys/values are percent-encoded so their :(), chars
+        # don't collide with the RestLi structure (this matters for staffCountRange
+        # values like urn:li:staffCountRange:(201,500)). Sent via __raw_query so
+        # requests doesn't double-encode the structural characters.
+        restli = _targeting_to_restli(targeting)
+        raw = f"q=targetingCriteriaV2&targetingCriteria={restli}"
+        data = linkedin_api_request("GET", "/audienceCounts", params={"__raw_query": raw})
         if "error" in data:
             return f"Error: {data['error']}"
 
-        total = data.get("total", data.get("elements", [{}])[0].get("total", "N/A") if data.get("elements") else "N/A")
-        active_count = data.get("activeCount", "N/A")
+        elements = data.get("elements", [])
+        first = elements[0] if elements else {}
+        total = first.get("total", "N/A")
+        active = first.get("active", "N/A")
 
         lines = [f"Audience Size Estimate for Account {account_id}:"]
         lines.append("=" * 60)
-        lines.append(f"  Total estimated audience: {total}")
-        if active_count != "N/A":
-            lines.append(f"  Active members (30 days): {active_count}")
-        lines.append(f"\n  Targeting criteria used:")
-        lines.append(f"  {json.dumps(targeting, indent=2)}")
+        lines.append(f"  Total audience: {total}")
+        lines.append(f"  Active audience (more likely to visit LinkedIn): {active}")
+        if isinstance(total, int) and total < 300:
+            lines.append("  ⚠ Below LinkedIn's 300-member minimum to run a campaign "
+                         "(the API reports 0 when the true size is under 300).")
         return "\n".join(lines)
     except json.JSONDecodeError:
         return "Error: Invalid JSON in targeting_criteria_json parameter."
