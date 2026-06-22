@@ -32,7 +32,7 @@ except ImportError:
 # Config
 CLIENT_ID = os.environ.get("LINKEDIN_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("LINKEDIN_CLIENT_SECRET", "")
-SCOPES = os.environ.get("LINKEDIN_OAUTH_SCOPES", "r_ads_reporting,r_ads,rw_ads,rw_organization_admin,r_organization_admin,r_basicprofile")
+SCOPES = os.environ.get("LINKEDIN_OAUTH_SCOPES", "r_ads_reporting,r_ads,rw_ads,rw_organization_admin,r_organization_admin,r_basicprofile,w_organization_social,r_organization_social")
 REDIRECT_URI = "http://localhost:8000/callback"
 ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
@@ -98,7 +98,11 @@ def exchange_code_for_token(code: str) -> dict:
         print(f"\nError exchanging code for token: {resp.status_code}")
         print(resp.text)
         sys.exit(1)
-    return resp.json()
+    tok = resp.json()
+    print("\n=== GRANTED SCOPES ===")
+    print(tok.get("scope", "(no scope field returned)"))
+    print("======================")
+    return tok
 
 
 def save_token(token_data: dict):

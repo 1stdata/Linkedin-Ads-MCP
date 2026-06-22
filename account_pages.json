@@ -1,4 +1,4 @@
 {
-  "_comment": "Map each ad account ID to the Page (organization URN) that should own its ads. Fill from list_pages output.",
-  "507196009": "urn:li:organization:REPLACE_WITH_FRAMEWORK_PAGE_ID"
+  "_comment": "Map each ad account ID to the Page (organization URN) that owns its ads.",
+  "507196009": "urn:li:organization:40686922"
 }

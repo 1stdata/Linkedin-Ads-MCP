@@ -84,7 +84,7 @@ def _created_urn(resp: requests.Response) -> str:
 
 
 def _get(path: str, params: Optional[dict] = None, token: Optional[str] = None) -> dict:
-    resp = requests.get(f"{API_BASE}{path}", headers=_headers(token), params=params or {})
+    resp = requests.get(f"{API_BASE}{path}", headers=_headers(token), params=params or {}, timeout=30)
     if resp.status_code >= 400:
         raise RuntimeError(f"GET {path} failed ({resp.status_code}): {resp.text}")
     try:
@@ -168,7 +168,7 @@ def upload_image(image_path: str, owner_urn: Optional[str] = None,
     init = requests.post(
         f"{API_BASE}/images?action=initializeUpload",
         headers=_headers(token),
-        json={"initializeUploadRequest": {"owner": owner}},
+        json={"initializeUploadRequest": {"owner": owner}}, timeout=30,
     )
     if init.status_code >= 400:
         raise RuntimeError(f"initializeUpload failed ({init.status_code}): {init.text}")
@@ -181,7 +181,7 @@ def upload_image(image_path: str, owner_urn: Optional[str] = None,
     # 1b. PUT the binary (only the bearer token on this request)
     with open(image_path, "rb") as f:
         data = f.read()
-    put = requests.put(upload_url, headers={"Authorization": f"Bearer {token}"}, data=data)
+    put = requests.put(upload_url, headers={"Authorization": f"Bearer {token}"}, data=data, timeout=180)
     if put.status_code not in (200, 201):
         raise RuntimeError(f"image upload PUT failed ({put.status_code}): {put.text}")
     return image_urn
@@ -191,14 +191,19 @@ def upload_image(image_path: str, owner_urn: Optional[str] = None,
 # Step 2 — create the sponsored (dark) post that backs the ad
 # ---------------------------------------------------------------------------
 def create_link_post(owner_urn: str, image_urn: str, intro_text: str,
-                     headline: str, destination_url: str,
+                     headline: str, destination_url: str, account_id: str,
                      description: str = "", token: Optional[str] = None) -> str:
     """Create a Direct Sponsored Content link post (image + headline → URL).
 
     Returns the post URN (urn:li:share:... or urn:li:ugcPost:...).
-    feedDistribution=NONE makes it a dark post usable only as an ad.
+    adContext + feedDistribution=NONE registers it as DSC (a dark ad post),
+    tied to the ad account so it never shows on the Page feed.
     """
     body = {
+        "adContext": {
+            "dscAdAccount": f"urn:li:sponsoredAccount:{account_id}",
+            "dscStatus": "ACTIVE",
+        },
         "author": owner_urn,
         "commentary": intro_text,
         "visibility": "PUBLIC",
@@ -216,9 +221,9 @@ def create_link_post(owner_urn: str, image_urn: str, intro_text: str,
             }
         },
         "lifecycleState": "PUBLISHED",
-        "isReshareDisabledByAuthor": False,
+        "isReshareDisabledByAuthor": True,
     }
-    resp = requests.post(f"{API_BASE}/posts", headers=_headers(token), json=body)
+    resp = requests.post(f"{API_BASE}/posts", headers=_headers(token), json=body, timeout=60)
     if resp.status_code >= 400:
         raise RuntimeError(f"create post failed ({resp.status_code}): {resp.text}")
     post_urn = _created_urn(resp)
@@ -231,21 +236,17 @@ def create_link_post(owner_urn: str, image_urn: str, intro_text: str,
 # Step 3 — create the ad (sponsoredCreative) referencing the post
 # ---------------------------------------------------------------------------
 def create_creative(account_id: str, campaign_id: str, post_urn: str,
-                    call_to_action: str = "LEARN_MORE", status: str = "ACTIVE",
+                    call_to_action: str = "LEARN_MORE", status: str = "DRAFT",
                     token: Optional[str] = None) -> str:
     """Create the ad under a campaign (ad set). Returns the creative URN/id."""
-    cta = (call_to_action or "LEARN_MORE").upper().replace(" ", "_")
-    if cta not in VALID_CTAS:
-        cta = "LEARN_MORE"
     body = {
         "campaign": f"urn:li:sponsoredCampaign:{campaign_id}",
-        "status": status.upper(),
         "intendedStatus": status.upper(),
-        "content": {"reference": post_urn, "callToAction": {"labelType": cta}},
+        "content": {"reference": post_urn},
     }
     resp = requests.post(
         f"{API_BASE}/adAccounts/{account_id}/creatives",
-        headers=_headers(token), json=body,
+        headers=_headers(token), json=body, timeout=60,
     )
     if resp.status_code >= 400:
         raise RuntimeError(f"create creative failed ({resp.status_code}): {resp.text}")
@@ -258,14 +259,14 @@ def create_creative(account_id: str, campaign_id: str, post_urn: str,
 def create_single_image_ad(account_id: str, campaign_id: str, image_path: str,
                            intro_text: str, headline: str, destination_url: str,
                            call_to_action: str = "LEARN_MORE",
-                           owner_urn: Optional[str] = None, status: str = "ACTIVE",
+                           owner_urn: Optional[str] = None, status: str = "DRAFT",
                            token: Optional[str] = None) -> dict:
     """Upload image → create dark post → create ad. Returns the IDs created."""
     token = token or get_token()
     owner = owner_urn or resolve_page_for_account(account_id, token)
     image_urn = upload_image(image_path, owner, token)
     post_urn = create_link_post(owner, image_urn, intro_text, headline,
-                                destination_url, token=token)
+                                destination_url, account_id, token=token)
     creative = create_creative(account_id, campaign_id, post_urn,
                                call_to_action, status, token)
     return {"image_urn": image_urn, "post_urn": post_urn, "creative": creative}
@@ -276,7 +277,7 @@ def create_single_image_ad(account_id: str, campaign_id: str, image_path: str,
 # ---------------------------------------------------------------------------
 # CSV columns: image_path, intro_text, headline, call_to_action, destination_url
 def bulk_create_from_csv(account_id: str, campaign_id: str, csv_path: str,
-                         owner_urn: Optional[str] = None, status: str = "ACTIVE",
+                         owner_urn: Optional[str] = None, status: str = "DRAFT",
                          token: Optional[str] = None) -> list:
     """Create one single-image ad per CSV row. Returns a per-row result list."""
     owner = owner_urn or DEFAULT_ORG_URN

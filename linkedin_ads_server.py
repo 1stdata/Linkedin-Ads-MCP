@@ -1152,17 +1152,11 @@ async def create_creative(
     try:
         body: dict = {
             "campaign": format_campaign_urn(campaign_id),
-            "status": status.upper(),
             "intendedStatus": intended_status.upper(),
             "content": {
                 "reference": content_reference,
             },
         }
-
-        if call_to_action:
-            body["content"]["callToAction"] = {
-                "labelType": call_to_action.upper(),
-            }
 
         data = linkedin_api_request("POST", f"/adAccounts/{account_id}/creatives", json_body=body)
         if "error" in data:
@@ -3257,7 +3251,7 @@ async def create_single_image_ad(
     destination_url: str = Field(description="Landing page URL (https://...)"),
     call_to_action: str = Field(default="LEARN_MORE", description="CTA: LEARN_MORE, REQUEST_DEMO, SIGN_UP, DOWNLOAD, REGISTER, ..."),
     owner_org_urn: str = Field(default="", description="Organization (Page) URN. Defaults to LINKEDIN_ORG_URN."),
-    status: str = Field(default="ACTIVE", description="ACTIVE, PAUSED, or DRAFT"),
+    status: str = Field(default="DRAFT", description="DRAFT (safe, no spend), ACTIVE (goes to review), or PAUSED (only after approved)"),
 ) -> str:
     """Create a complete single-image ad: uploads the image, creates the sponsored post, and creates the ad."""
     try:
@@ -3281,7 +3275,7 @@ async def bulk_create_single_image_ads(
     campaign_id: str = Field(description="Campaign (ad set) ID for all ads"),
     csv_path: str = Field(description="CSV columns: image_path, intro_text, headline, call_to_action, destination_url"),
     owner_org_urn: str = Field(default="", description="Organization (Page) URN. Defaults to LINKEDIN_ORG_URN."),
-    status: str = Field(default="ACTIVE", description="ACTIVE, PAUSED, or DRAFT"),
+    status: str = Field(default="DRAFT", description="DRAFT (safe, no spend), ACTIVE (goes to review), or PAUSED (only after approved)"),
 ) -> str:
     """Create many single-image ads from a CSV (one ad per row)."""
     try:
@@ -3378,7 +3372,7 @@ async def duplicate_ad(
     account_id: str = Field(description="LinkedIn Ad Account ID"),
     source_creative_id: str = Field(description="Creative (ad) ID to clone"),
     target_campaign_id: str = Field(description="Campaign (ad set) ID to create the copy in"),
-    status: str = Field(default="PAUSED", description="ACTIVE, PAUSED, or DRAFT"),
+    status: str = Field(default="DRAFT", description="DRAFT, ACTIVE, or PAUSED"),
 ) -> str:
     """Duplicate an existing ad (its image + copy) into another campaign / ad set."""
     try:
@@ -3391,7 +3385,6 @@ async def duplicate_ad(
             return f"Source creative has no content reference; cannot duplicate. Raw: {src}"
         body = {
             "campaign": format_campaign_urn(target_campaign_id),
-            "status": status.upper(),
             "intendedStatus": status.upper(),
             "content": content,
         }
