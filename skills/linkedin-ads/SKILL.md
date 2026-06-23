@@ -23,7 +23,9 @@ creation works on the first try.
   `update_campaign`, `schedule_campaign`, `pause_resume_campaign`, `set_campaign_budget`,
   `set_bid_strategy`
 - **Targeting:** `get_targeting_facets`, `get_targeting_entities`,
-  `estimate_audience_size`, `set_campaign_targeting`, `create_saved_audience`
+  `estimate_audience_size`, `set_campaign_targeting`, `create_saved_audience`,
+  `add_employer_exclusions` (safe read-merge-write: add company exclusions to many
+  campaigns at once by name/URN without disturbing existing targeting)
 - **Discovery:** `list_accounts`, `list_pages`, `resolve_page_for_account`,
   `list_campaigns`, `list_creatives`, `list_lead_forms`, `list_conversions`
 - **Analytics:** `get_campaign_analytics`, `get_account_analytics`,
@@ -181,6 +183,9 @@ This is genuinely effective: it captures people whose real title (e.g. "SVP Supp
 - **Job functions** (`urn:li:function:N`): Customer Success and Support = **26**; Information Technology = 13; Operations = 18; Engineering = 8; Sales = 25 (full list via `get_targeting_entities(facet="urn:li:adTargetingFacet:jobFunctions")`).
 - **Locations**: United States = `urn:li:geo:103644278` · Canada = `urn:li:geo:101174742`.
 - **TicketMind industries** (`urn:li:industry:N`): Software Development 4 · IT Services & IT Consulting 96 · Computer & Network Security 118 · Telecommunications 8 · Technology, Information & Internet 6 · Computer Networking Products 5 · Financial Services 43 · Data Infrastructure & Analytics 2458 · Hospitals & Health Care 14 · Internet Marketplace Platforms 1285. (Cloud Computing / IoT / Managed Services have NO standardized industry — covered by Software Dev / IT Services / Tech-Info-Internet.)
+
+## Excluding companies across many campaigns
+Use `add_employer_exclusions(account_id, campaign_ids, companies)` — it resolves each company (name → top employer-typeahead match, or pass an org URN/ID), then for EACH campaign reads the live targetingCriteria and merges the orgs into `exclude.or[employers]`, preserving every other include/exclude. Separate `companies` with **semicolons/newlines** (names contain commas). Auto-targeted campaigns (no manual `include`) are skipped, not broken. This replaced the error-prone hand-rebuild of each campaign's full targeting JUST to add an exclusion. Reasons to exclude: client partner lists, existing customers, competitors, or off-ICP companies seen in `get_company_performance`.
 
 ## Discovery (find IDs before duplicating / analyzing)
 - `list_campaigns(account_id, campaign_group_id=…)` and `list_campaign_groups(account_id)` — fixed June 2026 to use the account-scoped path (the old version 400'd with `FIELD_INVALID "search/account"` because it put `account` in the search criteria; account belongs in the PATH, only status/campaignGroup go in `search`).

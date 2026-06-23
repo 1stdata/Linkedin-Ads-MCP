@@ -3487,6 +3487,99 @@ async def set_campaign_targeting(
 
 
 @mcp.tool()
+async def add_employer_exclusions(
+    account_id: str = Field(description="LinkedIn Ad Account ID"),
+    campaign_ids: str = Field(description="Comma-separated campaign IDs to update"),
+    companies: str = Field(description="Company list to EXCLUDE — separate entries with SEMICOLONS or newlines (names can contain commas). Accepts company names (typeahead-resolved), org URNs (urn:li:organization:123), or bare org IDs."),
+    format: str = Field(default="table", description="Output format: table, json, or csv"),
+) -> str:
+    """Add company (employer) exclusions to one or more campaigns WITHOUT disturbing
+    the rest of their targeting (safe read-merge-write).
+
+    For each campaign it reads the current targetingCriteria, merges the resolved
+    organizations into exclude.or['urn:li:adTargetingFacet:employers'] (dedup), and
+    PATCHes — every existing include/exclude is preserved exactly. Names are resolved
+    to the top employer typeahead match (review the returned mapping). Campaigns with
+    no manual targeting (auto-targeted) are skipped, not broken.
+    """
+    try:
+        EMP = "urn:li:adTargetingFacet:employers"
+        cids = [c.strip() for c in campaign_ids.split(",") if c.strip()]
+        raw_items = [c.strip() for c in companies.replace("\n", ";").split(";") if c.strip()]
+        if not cids:
+            return "No campaign IDs provided."
+        if not raw_items:
+            return "No companies provided."
+
+        # --- Resolve each company entry -> org URN (once) ---
+        resolved = {}      # urn -> "input -> matched name"
+        unresolved = []
+        for item in raw_items:
+            if item.startswith("urn:li:organization:"):
+                resolved[item] = item
+            elif item.isdigit():
+                resolved[f"urn:li:organization:{item}"] = item
+            else:
+                try:
+                    data = linkedin_api_request("GET", "/adTargetingEntities", params={
+                        "q": "typeahead", "facet": EMP, "query": item,
+                        "count": 1, "queryVersion": "QUERY_USES_URNS",
+                    })
+                except Exception:
+                    data = {}
+                el = (data.get("elements") or [{}])[0] if isinstance(data, dict) else {}
+                urn = el.get("urn")
+                if not urn and isinstance(el.get("value"), dict):
+                    urn = el["value"].get("string")
+                if urn:
+                    resolved[urn] = f"{item} -> {el.get('name', urn)}"
+                else:
+                    unresolved.append(item)
+
+        add_urns = list(resolved.keys())
+        if not add_urns:
+            return "Could not resolve any companies to organizations.\nUnresolved: " + ", ".join(unresolved)
+
+        rows = []
+        for cid in cids:
+            data = linkedin_api_request("GET", f"/adAccounts/{account_id}/adCampaigns/{cid}")
+            if not isinstance(data, dict) or "error" in data:
+                rows.append({"campaign": cid, "result": "ERROR reading campaign", "added": 0})
+                continue
+            criteria = data.get("targetingCriteria") or {}
+            if not criteria.get("include"):
+                rows.append({"campaign": cid, "result": "SKIP (auto-targeted / no manual targeting)", "added": 0})
+                continue
+            exclude = criteria.get("exclude") or {}
+            or_block = exclude.get("or") or {}
+            existing = list(or_block.get(EMP, []))
+            merged = list(dict.fromkeys(existing + add_urns))
+            added = len(merged) - len(existing)
+            or_block[EMP] = merged
+            exclude["or"] = or_block
+            criteria["exclude"] = exclude
+            body = {"patch": {"$set": {"targetingCriteria": criteria}}}
+            resp = linkedin_api_request(
+                "POST", f"/adAccounts/{account_id}/adCampaigns/{cid}",
+                json_body=body, extra_headers={"X-RestLi-Method": "PARTIAL_UPDATE"},
+            )
+            if isinstance(resp, dict) and "error" in resp:
+                rows.append({"campaign": cid, "result": "ERROR writing", "added": 0})
+            else:
+                rows.append({"campaign": cid, "result": "OK", "added": added, "total_excluded": len(merged)})
+
+        out = [f"Employer exclusions — {len(cids)} campaign(s), {len(add_urns)} org(s) resolved.",
+               "Resolved: " + "; ".join(resolved.values())]
+        if unresolved:
+            out.append("UNRESOLVED (skipped — fix the name or pass an org URN): " + ", ".join(unresolved))
+        out.append("=" * 60)
+        out.append(format_output(rows, format))
+        return "\n".join(out)
+    except Exception as e:
+        return f"Error adding employer exclusions: {e}"
+
+
+@mcp.tool()
 async def duplicate_ad(
     account_id: str = Field(description="LinkedIn Ad Account ID"),
     source_creative_id: str = Field(description="Creative (ad) ID to clone"),
