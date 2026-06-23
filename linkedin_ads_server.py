@@ -512,17 +512,14 @@ async def list_campaign_groups(
         A formatted list of campaign groups.
     """
     try:
-        acct_urn = format_account_urn(account_id).replace(":", "%3A")
-        search_expr = f"(account:(values:List({acct_urn})))"
+        # Account goes in the PATH; the finder rejects `account` in the search
+        # criteria (400 FIELD_INVALID "search/account"). Only status in search.
+        params: dict = {"q": "search"}
         if status_filter:
             statuses = ",".join(s.strip() for s in status_filter.split(","))
-            search_expr = f"(account:(values:List({acct_urn})),status:(values:List({statuses})))"
-        params: dict = {
-            "q": "search",
-            "__raw_query": f"search={search_expr}",
-        }
+            params["__raw_query"] = f"search=(status:(values:List({statuses})))"
 
-        elements = linkedin_paginated_request("/adCampaignGroups", params=params)
+        elements = linkedin_paginated_request(f"/adAccounts/{account_id}/adCampaignGroups", params=params)
 
         if not elements:
             return "No campaign groups found."
@@ -695,8 +692,10 @@ async def list_campaigns(
         A formatted list of campaigns with key details.
     """
     try:
-        acct_urn = format_account_urn(account_id).replace(":", "%3A")
-        search_parts = [f"account:(values:List({acct_urn}))"]
+        # Account goes in the PATH. Do NOT put `account` in the search criteria —
+        # the /rest finder rejects it (400 FIELD_INVALID "search/account
+        # unrecognized field"). Only status/campaignGroup belong in search.
+        search_parts = []
         if status_filter:
             statuses = ",".join(s.strip() for s in status_filter.split(","))
             search_parts.append(f"status:(values:List({statuses}))")
@@ -704,13 +703,11 @@ async def list_campaigns(
             grp_urn = format_campaign_group_urn(account_id, campaign_group_id).replace(":", "%3A")
             search_parts.append(f"campaignGroup:(values:List({grp_urn}))")
 
-        search_expr = "(" + ",".join(search_parts) + ")"
-        params = {
-            "q": "search",
-            "__raw_query": f"search={search_expr}",
-        }
+        params = {"q": "search"}
+        if search_parts:
+            params["__raw_query"] = "search=(" + ",".join(search_parts) + ")"
 
-        elements = linkedin_paginated_request("/adCampaigns", params=params)
+        elements = linkedin_paginated_request(f"/adAccounts/{account_id}/adCampaigns", params=params)
 
         if not elements:
             return "No campaigns found."
