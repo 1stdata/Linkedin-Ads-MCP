@@ -1300,6 +1300,46 @@ def _resolve_org_names(org_ids: list) -> dict:
     return names
 
 
+def _resolve_entity_names(urns: list) -> dict:
+    """Resolve adTargeting entity URNs -> names via /adTargetingEntities?q=urns.
+
+    Universal resolver for industry / title / seniority / function / geo / etc.
+    URNs (the value types behind the MEMBER_* demographic pivots). Returns a map
+    keyed by BOTH the full URN and its bare ID, so callers can look up either.
+    Best-effort: never raises; unresolved URNs are simply omitted.
+    """
+    from urllib.parse import quote
+    out: dict = {}
+    urns = [u for u in dict.fromkeys(urns) if isinstance(u, str) and u.startswith("urn:")]
+    if not urns:
+        return out
+    CHUNK = 40
+    for i in range(0, len(urns), CHUNK):
+        chunk = urns[i:i + CHUNK]
+        raw = "urns=List(" + ",".join(quote(u, safe="") for u in chunk) + ")"
+        try:
+            data = linkedin_api_request("GET", "/adTargetingEntities",
+                                        params={"q": "urns", "__raw_query": raw})
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        for el in data.get("elements", []):
+            urn = el.get("urn")
+            name = el.get("name")
+            if urn and name:
+                out[urn] = name
+                out[extract_id_from_urn(urn)] = name
+    return out
+
+
+# Demographic pivots whose values are entity URNs resolvable to names.
+_RESOLVABLE_DEMO_PIVOTS = {
+    "MEMBER_INDUSTRY", "MEMBER_JOB_TITLE", "MEMBER_SENIORITY",
+    "MEMBER_JOB_FUNCTION", "MEMBER_COUNTRY_V2", "MEMBER_REGION_V2",
+}
+
+
 def _format_analytics_results(elements: list, pivot: str, format_type: str = "table",
                               name_map: Optional[dict] = None, name_label: str = "name") -> str:
     """Format analytics results into requested format.
@@ -1537,13 +1577,16 @@ async def get_demographic_analytics(
     demographic_type: str = Field(description="Demographic pivot: MEMBER_JOB_TITLE, MEMBER_JOB_FUNCTION, MEMBER_SENIORITY, MEMBER_INDUSTRY, MEMBER_COMPANY_SIZE, MEMBER_COUNTRY_V2, MEMBER_REGION_V2"),
     campaign_ids: str = Field(default="", description="Comma-separated campaign IDs to filter (leave empty for all)"),
     time_granularity: str = Field(default="ALL", description="Time granularity: DAILY, MONTHLY, or ALL"),
+    resolve_names: bool = Field(default=True, description="Resolve entity IDs (industry/title/seniority/function/geo) to readable names; set false for speed"),
     format: str = Field(default="table", description="Output format: 'table', 'json', or 'csv'"),
 ) -> str:
     """
     Get audience demographic breakdowns for campaigns.
 
     Supports breakdowns by job title, job function, seniority, industry,
-    company size, country, and region.
+    company size, country, and region. For URN-based pivots (title, industry,
+    seniority, function, country, region) the IDs are resolved to readable
+    names (a `name` column) by default; set resolve_names=False to skip.
 
     Args:
         account_id: The numeric ad account ID.
@@ -1552,10 +1595,11 @@ async def get_demographic_analytics(
         demographic_type: The MEMBER_* pivot type.
         campaign_ids: Optional comma-separated campaign IDs.
         time_granularity: DAILY, MONTHLY, or ALL (recommended: ALL for demographics).
+        resolve_names: Resolve entity IDs to names (default True).
         format: Output format.
 
     Returns:
-        Formatted demographic analytics.
+        Formatted demographic analytics (with a name column where resolvable).
     """
     try:
         cids = [c.strip() for c in campaign_ids.split(",") if c.strip()] if campaign_ids else None
@@ -1571,9 +1615,19 @@ async def get_demographic_analytics(
 
         elements = linkedin_paginated_request("/adAnalytics", params=params)
 
+        name_map = None
+        if resolve_names and elements and pivot in _RESOLVABLE_DEMO_PIVOTS:
+            urns = []
+            for el in elements:
+                pv = el.get("pivotValue") or (el.get("pivotValues") or [""])[0]
+                if isinstance(pv, str) and pv.startswith("urn:"):
+                    urns.append(pv)
+            name_map = _resolve_entity_names(urns)
+
         output_lines = [f"Demographic Analytics ({pivot}) for Account {account_id} ({start_date} to {end_date}):"]
         output_lines.append("=" * 100)
-        output_lines.append(_format_analytics_results(elements, pivot, format))
+        output_lines.append(_format_analytics_results(elements, pivot, format,
+                                                      name_map=name_map, name_label="name"))
         return "\n".join(output_lines)
     except Exception as e:
         return f"Error getting demographic analytics: {str(e)}"
