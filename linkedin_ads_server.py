@@ -1262,8 +1262,52 @@ def _build_analytics_params(
     return params
 
 
-def _format_analytics_results(elements: list, pivot: str, format_type: str = "table") -> str:
-    """Format analytics results into requested format."""
+def _resolve_org_names(org_ids: list) -> dict:
+    """Batch-resolve LinkedIn organization IDs -> display names via /organizations.
+
+    Returns {id_str: name}. IDs that can't be resolved are simply omitted so the
+    caller can fall back to the raw ID. Chunks requests to stay within RestLi
+    limits and never raises (name resolution is best-effort).
+    """
+    names: dict = {}
+    ids = [str(i).strip() for i in org_ids if str(i).strip().isdigit()]
+    ids = list(dict.fromkeys(ids))  # dedup, preserve order
+    if not ids:
+        return names
+    CHUNK = 50
+    for i in range(0, len(ids), CHUNK):
+        chunk = ids[i:i + CHUNK]
+        raw = "ids=List(" + ",".join(chunk) + ")"
+        try:
+            data = linkedin_api_request("GET", "/organizations", params={"__raw_query": raw})
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        results = data.get("results", {})
+        for oid, org in results.items():
+            if not isinstance(org, dict):
+                continue
+            name = org.get("localizedName") or org.get("vanityName")
+            if not name:
+                nm = org.get("name")
+                if isinstance(nm, dict):
+                    loc = nm.get("localized", {})
+                    if isinstance(loc, dict) and loc:
+                        name = next(iter(loc.values()), None)
+            if name:
+                names[str(oid)] = name
+    return names
+
+
+def _format_analytics_results(elements: list, pivot: str, format_type: str = "table",
+                              name_map: Optional[dict] = None, name_label: str = "name") -> str:
+    """Format analytics results into requested format.
+
+    If name_map is provided, a human-readable column (name_label) is inserted
+    right after the pivot value, mapping the pivot ID -> name (falls back to the
+    raw ID when a name isn't available).
+    """
     if not elements:
         return "No analytics data found for the specified criteria."
 
@@ -1278,6 +1322,8 @@ def _format_analytics_results(elements: list, pivot: str, format_type: str = "ta
         if isinstance(pivot_val, str) and "urn:" in pivot_val:
             pivot_val = extract_id_from_urn(pivot_val)
         row["pivotValue"] = pivot_val
+        if name_map is not None:
+            row[name_label] = name_map.get(str(pivot_val), str(pivot_val))
 
         # Date range
         dr = el.get("dateRange", {})
@@ -1946,12 +1992,15 @@ async def get_company_performance(
     end_date: str = Field(description="End date in YYYY-MM-DD format"),
     campaign_ids: str = Field(default="", description="Comma-separated campaign IDs to filter (leave empty for all)"),
     limit: int = Field(default=200, description="Maximum number of company rows to return"),
+    resolve_names: bool = Field(default=True, description="Resolve company IDs to readable names via organizationsLookup (adds a few lookups; set false for speed)"),
     format: str = Field(default="table", description="Output format: 'table', 'json', or 'csv'"),
 ) -> str:
     """
     Get performance broken down by company (organization) that saw or clicked ads.
 
     Shows which companies your ads reached, with impressions, clicks, and cost.
+    By default the LinkedIn company IDs are resolved to readable company names
+    (a `company` column); set resolve_names=False to skip the extra lookups.
 
     Args:
         account_id: The numeric ad account ID.
@@ -1959,10 +2008,11 @@ async def get_company_performance(
         end_date: End date (YYYY-MM-DD).
         campaign_ids: Optional comma-separated campaign IDs.
         limit: Max rows to return.
+        resolve_names: Resolve org IDs to names (default True).
         format: Output format.
 
     Returns:
-        Formatted company-level performance data.
+        Formatted company-level performance data (company name + metrics).
     """
     try:
         cids = [c.strip() for c in campaign_ids.split(",") if c.strip()] if campaign_ids else None
@@ -1977,9 +2027,19 @@ async def get_company_performance(
 
         elements = linkedin_paginated_request("/adAnalytics", params=params, max_results=limit)
 
+        name_map = None
+        if resolve_names and elements:
+            org_ids = []
+            for el in elements:
+                pv = el.get("pivotValue") or (el.get("pivotValues") or [""])[0]
+                if isinstance(pv, str) and pv:
+                    org_ids.append(extract_id_from_urn(pv))
+            name_map = _resolve_org_names(org_ids)
+
         output_lines = [f"Company Performance for Account {account_id} ({start_date} to {end_date}):"]
         output_lines.append("=" * 100)
-        output_lines.append(_format_analytics_results(elements, "MEMBER_COMPANY", format))
+        output_lines.append(_format_analytics_results(elements, "MEMBER_COMPANY", format,
+                                                      name_map=name_map, name_label="company"))
         return "\n".join(output_lines)
     except Exception as e:
         return f"Error getting company performance: {str(e)}"
