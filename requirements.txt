@@ -12,3 +12,5 @@ flask>=3.0.0
 gunicorn>=22.0.0
 pillow>=10.0.0
 uvicorn>=0.30.0
+# WSGI->ASGI bridge so the Flask dashboard runs under uvicorn alongside the MCP
+asgiref>=3.7.0
