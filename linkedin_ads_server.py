@@ -1263,41 +1263,18 @@ def _build_analytics_params(
 
 
 def _resolve_org_names(org_ids: list) -> dict:
-    """Batch-resolve LinkedIn organization IDs -> display names via /organizations.
+    """Resolve LinkedIn organization IDs -> display names.
 
-    Returns {id_str: name}. IDs that can't be resolved are simply omitted so the
-    caller can fall back to the raw ID. Chunks requests to stay within RestLi
-    limits and never raises (name resolution is best-effort).
+    Uses the universal adTargetingEntities `q=urns` finder (the same path that
+    resolves industries/titles) on `urn:li:organization:{id}` URNs. This works
+    with the Marketing token for ANY company your ads reached — unlike the
+    `/organizations` endpoint, which only returns orgs the member administers.
+    Returns {id_str: name} (and {urn: name}); unresolved IDs are omitted so the
+    caller falls back to the raw ID.
     """
-    names: dict = {}
-    ids = [str(i).strip() for i in org_ids if str(i).strip().isdigit()]
-    ids = list(dict.fromkeys(ids))  # dedup, preserve order
-    if not ids:
-        return names
-    CHUNK = 50
-    for i in range(0, len(ids), CHUNK):
-        chunk = ids[i:i + CHUNK]
-        raw = "ids=List(" + ",".join(chunk) + ")"
-        try:
-            data = linkedin_api_request("GET", "/organizations", params={"__raw_query": raw})
-        except Exception:
-            continue
-        if not isinstance(data, dict):
-            continue
-        results = data.get("results", {})
-        for oid, org in results.items():
-            if not isinstance(org, dict):
-                continue
-            name = org.get("localizedName") or org.get("vanityName")
-            if not name:
-                nm = org.get("name")
-                if isinstance(nm, dict):
-                    loc = nm.get("localized", {})
-                    if isinstance(loc, dict) and loc:
-                        name = next(iter(loc.values()), None)
-            if name:
-                names[str(oid)] = name
-    return names
+    urns = [f"urn:li:organization:{str(i).strip()}"
+            for i in org_ids if str(i).strip().isdigit()]
+    return _resolve_entity_names(urns)
 
 
 def _resolve_entity_names(urns: list) -> dict:
