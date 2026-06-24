@@ -436,9 +436,11 @@
           <div><label style="display:block;font-size:11px;color:var(--text-muted)">Max %/run</label><input id="paceMaxChange" type="number" step="1" value="20" style="width:80px"></div>
           <div><label style="display:block;font-size:11px;color:var(--text-muted)">Floor bid</label><input id="paceMinBid" type="number" step="0.01" placeholder="5" style="width:80px"></div>
           <div><label style="display:block;font-size:11px;color:var(--text-muted)">Ceiling bid</label><input id="paceMaxBid" type="number" step="0.01" placeholder="50" style="width:80px"></div>
+          <div><label style="display:block;font-size:11px;color:var(--text-muted)">Max CPL</label><input id="paceMaxCpl" type="number" step="0.01" placeholder="opt." style="width:80px"></div>
+          <div><label style="display:block;font-size:11px;color:var(--text-muted)">Max CPC</label><input id="paceMaxCpc" type="number" step="0.01" placeholder="opt." style="width:80px"></div>
           <button class="btn btn-sm btn-primary" onclick="addBidPacingRule()">Add rule</button>
         </div>
-        <div style="font-size:11px;color:var(--text-muted);margin-top:8px">Bids auto-adjust toward the daily budget, throttled by the monthly account cap over remaining <em>active</em> (scheduled) days. Off-days are skipped automatically.</div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:8px">Bids auto-adjust toward the daily budget, throttled by the monthly account cap over remaining <em>active</em> (scheduled) days. Off-days are skipped automatically. <strong>Max CPL/CPC</strong> (optional) stop the pacer from raising the bid into inefficient cost-per-result; it also stops raising when a prior raise didn't lift spend (delivery-capped).</div>
       </div>
 
       <div style="margin-top:16px">
@@ -1407,6 +1409,8 @@ async function addBidPacingRule() {
     max_change_pct: document.getElementById("paceMaxChange").value || 20,
     min_bid: document.getElementById("paceMinBid").value || 0,
     max_bid: document.getElementById("paceMaxBid").value || 0,
+    max_cpl: document.getElementById("paceMaxCpl").value || 0,
+    max_cpc: document.getElementById("paceMaxCpc").value || 0,
   };
   try {
     const r = await apiFetch("/api/bid-pacing/rules", { method: "POST", body: JSON.stringify(payload) });

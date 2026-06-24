@@ -3866,6 +3866,38 @@ def _fetch_account_spend(account_id: str, start_date: str, end_date: str) -> flo
     return total
 
 
+def _fetch_campaign_perf(account_id: str, campaign_id: str, start_date: str, end_date: str) -> dict:
+    """Aggregate cost / clicks / leads / conversions for a campaign over a window.
+
+    Used by the efficiency guardrail to compute recent cost-per-lead / cost-per-click.
+    """
+    params = _build_analytics_params(
+        account_id=account_id, pivot="CAMPAIGN", start_date=start_date,
+        end_date=end_date, time_granularity="ALL", campaign_ids=[campaign_id],
+    )
+    elements = linkedin_paginated_request("/adAnalytics", params=params)
+    cost = clicks = leads = conv = 0.0
+    for el in elements:
+        cost += float(el.get("costInLocalCurrency", 0) or 0)
+        clicks += float(el.get("clicks", 0) or 0)
+        leads += float(el.get("oneClickLeads", 0) or 0)
+        conv += float(el.get("externalWebsiteConversions", el.get("conversions", 0)) or 0)
+    cpl = (cost / leads) if leads > 0 else None
+    cpc = (cost / clicks) if clicks > 0 else None
+    return {"cost": cost, "clicks": clicks, "leads": leads, "conversions": conv, "cpl": cpl, "cpc": cpc}
+
+
+def _last_applied_raise(account_id: str, campaign_id: str):
+    """Most recent APPLIED bid raise for a campaign from history (for ceiling detection)."""
+    raises = [h for h in _load_bid_pacing_history()
+              if str(h.get("account_id")) == str(account_id)
+              and str(h.get("campaign_id")) == str(campaign_id)
+              and h.get("applied")
+              and float(h.get("new_bid", 0) or 0) > float(h.get("old_bid", 0) or 0)]
+    raises.sort(key=lambda h: h.get("timestamp", ""))
+    return raises[-1] if raises else None
+
+
 def _evaluate_bid_rule(rule: dict, now=None) -> dict:
     """Compute a bid recommendation for one rule. No side effects (no API write)."""
     try:
@@ -3916,6 +3948,59 @@ def _evaluate_bid_rule(rule: dict, now=None) -> dict:
     min_change = float(rule.get("min_change_pct", 2))
     target_ratio = float(rule.get("target_delivery_ratio", 0.95))
 
+    # Efficiency guardrail (Shape-style): don't raise the bid into bad cost-per-result
+    max_cpl = float(rule.get("max_cpl", 0) or 0)
+    max_cpc = float(rule.get("max_cpc", 0) or 0)
+    eff_window = int(rule.get("efficiency_window_days", 7) or 7)
+    perf = None
+    recent_cpl = recent_cpc = None
+    if max_cpl or max_cpc:
+        win_start = (today - timedelta(days=eff_window)).isoformat()
+        try:
+            perf = _fetch_campaign_perf(account_id, campaign_id, win_start, today.isoformat())
+            recent_cpl = perf["cpl"]
+            recent_cpc = perf["cpc"]
+        except Exception:
+            perf = None
+
+    def _efficiency_block_reason():
+        """Return a reason string if a bid RAISE should be blocked on efficiency, else ''."""
+        if perf is None:
+            return ""
+        # Cost-per-lead ceiling
+        if max_cpl:
+            if perf["leads"] > 0 and recent_cpl is not None and recent_cpl >= max_cpl:
+                return f"CPL ${recent_cpl:.2f} ≥ max ${max_cpl:.2f} ({eff_window}d) — not raising bid"
+            # No leads despite material spend = efficiency unknown/poor -> don't chase
+            if perf["leads"] == 0 and perf["cost"] >= 2 * max_cpl:
+                return f"${perf['cost']:.0f} spent over {eff_window}d with 0 leads (≥2× max CPL) — not raising bid"
+        # Cost-per-click ceiling
+        if max_cpc and perf["clicks"] > 0 and recent_cpc is not None and recent_cpc >= max_cpc:
+            return f"CPC ${recent_cpc:.2f} ≥ max ${max_cpc:.2f} ({eff_window}d) — not raising bid"
+        return ""
+
+    # Ceiling detection: did the last applied raise actually lift spend?
+    ceiling_response = float(rule.get("ceiling_response_pct", 5)) / 100.0
+    detect_ceiling = bool(rule.get("detect_ceiling", True))
+
+    def _ceiling_block_reason():
+        if not detect_ceiling:
+            return ""
+        lr = _last_applied_raise(account_id, campaign_id)
+        if not lr:
+            return ""
+        try:
+            lr_new = float(lr.get("new_bid", 0) or 0)
+            lr_prev_spend = float(lr.get("prior_day_spend", 0) or 0)
+        except (TypeError, ValueError):
+            return ""
+        # Only relevant if we're already at/above the bid from that raise
+        if lr_prev_spend > 0 and current_bid >= lr_new - 1e-9 \
+                and prior_day_spend <= lr_prev_spend * (1 + ceiling_response):
+            return (f"Delivery-capped: bid already raised to ${lr_new:.2f} but spend held at "
+                    f"~${prior_day_spend:.2f} (was ${lr_prev_spend:.2f}) — audience likely too small, holding")
+        return ""
+
     effective_daily = daily_budget
     monthly_note = ""
     if monthly_cap:
@@ -3929,6 +4014,8 @@ def _evaluate_bid_rule(rule: dict, now=None) -> dict:
             monthly_note = f"throttled by monthly cap (${remaining:.0f} left / {days_remaining}d)"
 
     reason_parts = []
+    efficiency_blocked = False
+    delivery_capped = False
     if sched and not today_is_active:
         target_bid = current_bid
         reason_parts.append("Campaign scheduled OFF today — holding bid (no spend expected)")
@@ -3942,7 +4029,19 @@ def _evaluate_bid_rule(rule: dict, now=None) -> dict:
         delivery_ratio = prior_day_spend / effective_daily if effective_daily else 1.0
         desired_factor = effective_daily / prior_day_spend
         factor = max(1 - max_change, min(1 + max_change, desired_factor))
-        if delivery_ratio < target_ratio:
+        eff_block = _efficiency_block_reason()
+        ceil_block = _ceiling_block_reason()
+        if delivery_ratio < target_ratio and eff_block:
+            # Under-pacing but efficiency too poor to chase more spend
+            target_bid = current_bid
+            efficiency_blocked = True
+            reason_parts.append(eff_block)
+        elif delivery_ratio < target_ratio and ceil_block:
+            # Under-pacing but a prior raise didn't move spend
+            target_bid = current_bid
+            delivery_capped = True
+            reason_parts.append(ceil_block)
+        elif delivery_ratio < target_ratio:
             target_bid = current_bid * factor
             reason_parts.append(
                 f"Under-pacing: prior day ${prior_day_spend:.2f} = {delivery_ratio * 100:.0f}% of "
@@ -3990,6 +4089,12 @@ def _evaluate_bid_rule(rule: dict, now=None) -> dict:
         "today_active": today_is_active,
         "baseline_day": baseline_day.isoformat(),
         "active_days_remaining": days_remaining,
+        "recent_cpl": round(recent_cpl, 2) if recent_cpl is not None else None,
+        "recent_cpc": round(recent_cpc, 2) if recent_cpc is not None else None,
+        "max_cpl": max_cpl or None,
+        "max_cpc": max_cpc or None,
+        "efficiency_blocked": efficiency_blocked,
+        "delivery_capped": delivery_capped,
         "will_change": will_change,
         "reason": "; ".join(reason_parts),
         "guardrails": {"max_change_pct": max_change * 100, "min_bid": min_bid, "max_bid": max_bid},
@@ -4049,6 +4154,8 @@ def _run_bid_pacer_engine(dry_run: bool = False) -> dict:
                 "effective_daily_target": decision["effective_daily_target"],
                 "mtd_account_spend": decision["mtd_account_spend"],
                 "monthly_account_cap": decision["monthly_account_cap"],
+                "recent_cpl": decision.get("recent_cpl"),
+                "recent_cpc": decision.get("recent_cpc"),
                 "reason": decision["reason"],
                 "source": "auto-pacer" + ("/dry-run" if dry_run else ""),
                 "applied": applied,
@@ -4071,6 +4178,9 @@ async def add_bid_pacing_rule(
     max_bid: str = Field(default="", description="Ceiling bid — pacer never goes above this"),
     min_change_pct: str = Field(default="2", description="Ignore tiny adjustments smaller than this %"),
     target_delivery_ratio: str = Field(default="0.95", description="Fraction of daily target the prior day should hit before the bid is considered 'on pace'"),
+    max_cpl: str = Field(default="", description="Efficiency guardrail: max cost-per-lead. The pacer won't raise the bid if recent CPL exceeds this. Leave empty to disable."),
+    max_cpc: str = Field(default="", description="Efficiency guardrail: max cost-per-click. The pacer won't raise the bid if recent CPC exceeds this. Leave empty to disable."),
+    efficiency_window_days: str = Field(default="7", description="Trailing days used to measure recent CPL/CPC for the efficiency guardrail"),
     timezone: str = Field(default="America/New_York", description="Timezone used to determine the day/month boundaries"),
     currency: str = Field(default="USD", description="Bid currency code"),
 ) -> str:
@@ -4099,6 +4209,10 @@ async def add_bid_pacing_rule(
             "max_bid": float(max_bid) if max_bid else 0.0,
             "min_change_pct": float(min_change_pct),
             "target_delivery_ratio": float(target_delivery_ratio),
+            "max_cpl": float(max_cpl) if max_cpl else 0.0,
+            "max_cpc": float(max_cpc) if max_cpc else 0.0,
+            "efficiency_window_days": int(efficiency_window_days) if efficiency_window_days else 7,
+            "detect_ceiling": True,
             "timezone": timezone,
             "currency": currency,
             "enabled": True,
