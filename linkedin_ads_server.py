@@ -3898,6 +3898,225 @@ def _last_applied_raise(account_id: str, campaign_id: str):
     return raises[-1] if raises else None
 
 
+def _active_fraction_elapsed(sched: Optional[dict], now) -> tuple:
+    """Fraction of TODAY'S active window that has elapsed at `now`, plus active-hour count.
+
+    No schedule -> fraction of the 24h day. Used by intraday pacing to compute
+    how much of the daily budget *should* have been spent by this point.
+    """
+    hours = _active_hours_for_day(sched, now.date())
+    if not hours:
+        return 0.0, 0
+    total = len(hours)
+    elapsed = 0.0
+    for h in hours:
+        if h < now.hour:
+            elapsed += 1.0
+        elif h == now.hour:
+            elapsed += now.minute / 60.0
+    return min(elapsed / total, 1.0), total
+
+
+def _count_applied_today(account_id: str, campaign_id: str, today, source_contains: str = "") -> int:
+    """Count APPLIED bid changes for a campaign whose timestamp date == today."""
+    n = 0
+    tstr = today.isoformat()
+    for h in _load_bid_pacing_history():
+        if str(h.get("account_id")) != str(account_id) or str(h.get("campaign_id")) != str(campaign_id):
+            continue
+        if not h.get("applied"):
+            continue
+        if source_contains and source_contains not in str(h.get("source", "")):
+            continue
+        if str(h.get("timestamp", "")).startswith(tstr):
+            n += 1
+    return n
+
+
+def _effective_daily_target(rule: dict, sched, today, next_month, account_id: str, daily_budget: float):
+    """Daily target throttled by the monthly account cap over remaining ACTIVE days.
+
+    Returns (effective_daily, note, monthly_cap, mtd_account, active_days_remaining).
+    """
+    monthly_cap = float(rule.get("monthly_account_cap") or 0)
+    mtd_account = _fetch_account_spend(account_id, today.replace(day=1).isoformat(), today.isoformat()) if monthly_cap else 0.0
+    days_remaining = _active_days_remaining(sched, today, next_month)
+    eff = daily_budget
+    note = ""
+    if monthly_cap:
+        remaining = max(monthly_cap - mtd_account, 0.0)
+        allowed = remaining / days_remaining if days_remaining > 0 else 0.0
+        if remaining <= 0:
+            eff, note = 0.0, "monthly account cap reached"
+        elif allowed < eff:
+            eff, note = allowed, f"throttled by monthly cap (${remaining:.0f} left / {days_remaining}d)"
+    return eff, note, monthly_cap, mtd_account, days_remaining
+
+
+def _evaluate_intraday_rule(rule: dict, now=None) -> dict:
+    """Intraday catch-up: during the active window, compare TODAY'S spend-so-far to
+    what should have been spent by now (budget x fraction of active window elapsed),
+    and RAISE the bid (gently) when behind. Raise-only — daily run handles lowering.
+    Respects efficiency (CPL/CPC), bid ceiling, and a per-day raise cap.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:  # pragma: no cover
+        from backports.zoneinfo import ZoneInfo
+    tz_name = rule.get("timezone", "America/New_York")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz, tz_name = ZoneInfo("UTC"), "UTC"
+    now = now or datetime.now(tz)
+
+    account_id = str(rule["account_id"])
+    campaign_id = str(rule["campaign_id"])
+    currency = rule.get("currency", "USD")
+
+    cfg = _get_campaign_bid_and_budget(account_id, campaign_id)
+    current_bid = cfg["bid"]
+    daily_budget = float(rule.get("daily_budget") or cfg["daily_budget"] or 0)
+
+    today = now.date()
+    if today.month == 12:
+        next_month = today.replace(year=today.year + 1, month=1, day=1)
+    else:
+        next_month = today.replace(month=today.month + 1, day=1)
+
+    sched = _schedule_for_campaign(account_id, campaign_id)
+    today_is_active = len(_active_hours_for_day(sched, today)) > 0
+    frac, _total = _active_fraction_elapsed(sched, now)
+
+    spend = _fetch_campaign_spend_by_date(account_id, campaign_id, today.isoformat(), today.isoformat())
+    today_spend = spend.get(today.isoformat(), 0.0)
+
+    effective_daily, monthly_note, monthly_cap, mtd_account, days_remaining = \
+        _effective_daily_target(rule, sched, today, next_month, account_id, daily_budget)
+
+    max_change = float(rule.get("intraday_max_change_pct", 10)) / 100.0
+    min_bid = float(rule.get("min_bid", 0) or 0)
+    max_bid = float(rule.get("max_bid", 0) or 0)
+    min_change = float(rule.get("min_change_pct", 2))
+    target_ratio = float(rule.get("target_delivery_ratio", 0.95))
+    end_guard = float(rule.get("intraday_end_guard", 0.9))
+    max_raises = int(rule.get("intraday_max_daily_raises", 6) or 6)
+
+    # Efficiency guardrail (same as daily)
+    max_cpl = float(rule.get("max_cpl", 0) or 0)
+    max_cpc = float(rule.get("max_cpc", 0) or 0)
+    eff_window = int(rule.get("efficiency_window_days", 7) or 7)
+    perf = None
+    recent_cpl = recent_cpc = None
+    if max_cpl or max_cpc:
+        try:
+            perf = _fetch_campaign_perf(account_id, campaign_id,
+                                        (today - timedelta(days=eff_window)).isoformat(), today.isoformat())
+            recent_cpl, recent_cpc = perf["cpl"], perf["cpc"]
+        except Exception:
+            perf = None
+
+    def _eff_block():
+        if perf is None:
+            return ""
+        if max_cpl:
+            if perf["leads"] > 0 and recent_cpl is not None and recent_cpl >= max_cpl:
+                return f"CPL ${recent_cpl:.2f} ≥ max ${max_cpl:.2f} ({eff_window}d) — not raising bid"
+            if perf["leads"] == 0 and perf["cost"] >= 2 * max_cpl:
+                return f"${perf['cost']:.0f} spent over {eff_window}d with 0 leads (≥2× max CPL) — not raising bid"
+        if max_cpc and perf["clicks"] > 0 and recent_cpc is not None and recent_cpc >= max_cpc:
+            return f"CPC ${recent_cpc:.2f} ≥ max ${max_cpc:.2f} ({eff_window}d) — not raising bid"
+        return ""
+
+    reason_parts = []
+    efficiency_blocked = False
+    delivery_capped = False
+    expected_now = effective_daily * frac
+
+    if sched and not today_is_active:
+        target_bid = current_bid
+        reason_parts.append("Scheduled OFF now — no intraday change")
+    elif effective_daily <= 0:
+        target_bid = current_bid
+        reason_parts.append("Monthly account cap reached — no intraday raise")
+    elif frac >= end_guard:
+        target_bid = current_bid
+        reason_parts.append(f"Near end of active window ({frac*100:.0f}%) — too late to raise today")
+    elif today_spend >= effective_daily:
+        target_bid = current_bid
+        reason_parts.append(f"Daily target ${effective_daily:.0f} already reached today — holding")
+    elif _count_applied_today(account_id, campaign_id, today, "intraday") >= max_raises:
+        target_bid = current_bid
+        reason_parts.append(f"Hit {max_raises} intraday raises today — holding to avoid runaway")
+    elif expected_now <= 0:
+        target_bid = current_bid
+        reason_parts.append("Active window just started — waiting for data")
+    else:
+        ratio = today_spend / expected_now if expected_now else 1.0
+        if ratio < target_ratio:
+            eb = _eff_block()
+            if eb:
+                target_bid = current_bid
+                efficiency_blocked = True
+                reason_parts.append(eb)
+            else:
+                desired = expected_now / today_spend if today_spend > 0 else (1 + max_change)
+                factor = max(1.0, min(1 + max_change, desired))
+                target_bid = current_bid * factor
+                reason_parts.append(
+                    f"Behind intraday: ${today_spend:.2f} spent vs ${expected_now:.2f} expected "
+                    f"({frac*100:.0f}% of window) — raising bid {(factor-1)*100:+.1f}%")
+        else:
+            target_bid = current_bid
+            reason_parts.append(
+                f"On intraday pace: ${today_spend:.2f} vs ${expected_now:.2f} expected — holding")
+    if monthly_note:
+        reason_parts.append(monthly_note)
+
+    if max_bid:
+        target_bid = min(target_bid, max_bid)
+    if min_bid:
+        target_bid = max(target_bid, min_bid)
+    target_bid = round(target_bid, 2)
+    pct_change = ((target_bid - current_bid) / current_bid * 100) if current_bid else 0.0
+    will_change = abs(pct_change) >= min_change and target_bid > current_bid + 1e-9  # intraday raises only
+
+    return {
+        "account_id": account_id,
+        "campaign_id": campaign_id,
+        "campaign_name": cfg["name"],
+        "timezone": tz_name,
+        "currency": currency,
+        "mode": "intraday",
+        "evaluated_at": now.isoformat(timespec="seconds"),
+        "current_bid": round(current_bid, 2),
+        "recommended_bid": target_bid,
+        "pct_change": round(pct_change, 1),
+        "daily_budget": round(daily_budget, 2),
+        "effective_daily_target": round(effective_daily, 2),
+        "window_fraction": round(frac, 3),
+        "expected_so_far": round(expected_now, 2),
+        "today_spend": round(today_spend, 2),
+        "prior_day_spend": round(today_spend, 2),
+        "monthly_account_cap": round(monthly_cap, 2),
+        "mtd_account_spend": round(mtd_account, 2),
+        "days_remaining_in_month": days_remaining,
+        "scheduled": bool(sched),
+        "today_active": today_is_active,
+        "baseline_day": today.isoformat(),
+        "active_days_remaining": days_remaining,
+        "recent_cpl": round(recent_cpl, 2) if recent_cpl is not None else None,
+        "recent_cpc": round(recent_cpc, 2) if recent_cpc is not None else None,
+        "max_cpl": max_cpl or None,
+        "max_cpc": max_cpc or None,
+        "efficiency_blocked": efficiency_blocked,
+        "delivery_capped": delivery_capped,
+        "will_change": will_change,
+        "reason": "; ".join(reason_parts),
+        "guardrails": {"intraday_max_change_pct": max_change * 100, "min_bid": min_bid, "max_bid": max_bid},
+    }
+
+
 def _evaluate_bid_rule(rule: dict, now=None) -> dict:
     """Compute a bid recommendation for one rule. No side effects (no API write)."""
     try:
@@ -4110,10 +4329,14 @@ def _apply_bid(account_id: str, campaign_id: str, new_bid: float, currency: str 
     )
 
 
-def _run_bid_pacer_engine(dry_run: bool = False) -> dict:
+def _run_bid_pacer_engine(dry_run: bool = False, mode: str = "daily") -> dict:
     """Evaluate every pacing rule, apply changes within guardrails, log history.
 
-    Shared by the run_bid_pacer MCP tool and the standalone bid_pacer.py cron script.
+    mode='daily'    -> once-a-day reset off the prior full active day's spend.
+    mode='intraday' -> catch-up during the active window vs today's expected pace.
+
+    Shared by the run_bid_pacer MCP tool, the dashboard background threads, and
+    the standalone bid_pacer.py script.
     """
     rules = _load_bid_pacing_rules().get("rules", [])
     results = []
@@ -4121,8 +4344,11 @@ def _run_bid_pacer_engine(dry_run: bool = False) -> dict:
         if not rule.get("enabled", True):
             results.append({"campaign_id": rule.get("campaign_id"), "skipped": "disabled"})
             continue
+        if mode == "intraday" and not rule.get("intraday_enabled", True):
+            results.append({"campaign_id": rule.get("campaign_id"), "skipped": "intraday disabled"})
+            continue
         try:
-            decision = _evaluate_bid_rule(rule)
+            decision = _evaluate_intraday_rule(rule) if mode == "intraday" else _evaluate_bid_rule(rule)
         except Exception as e:
             results.append({"campaign_id": rule.get("campaign_id"), "error": str(e)})
             continue
@@ -4148,6 +4374,7 @@ def _run_bid_pacer_engine(dry_run: bool = False) -> dict:
                 "new_bid": decision["recommended_bid"] if applied else decision["current_bid"],
                 "pct_change": decision["pct_change"],
                 "prior_day_spend": decision["prior_day_spend"],
+                "today_spend": decision.get("today_spend"),
                 "baseline_day": decision.get("baseline_day", ""),
                 "scheduled": decision.get("scheduled", False),
                 "daily_budget": decision["daily_budget"],
@@ -4157,7 +4384,7 @@ def _run_bid_pacer_engine(dry_run: bool = False) -> dict:
                 "recent_cpl": decision.get("recent_cpl"),
                 "recent_cpc": decision.get("recent_cpc"),
                 "reason": decision["reason"],
-                "source": "auto-pacer" + ("/dry-run" if dry_run else ""),
+                "source": ("auto-pacer-" + decision.get("mode", "daily")) + ("/dry-run" if dry_run else ""),
                 "applied": applied,
                 "error": decision.get("apply_error", ""),
             })
@@ -4181,6 +4408,9 @@ async def add_bid_pacing_rule(
     max_cpl: str = Field(default="", description="Efficiency guardrail: max cost-per-lead. The pacer won't raise the bid if recent CPL exceeds this. Leave empty to disable."),
     max_cpc: str = Field(default="", description="Efficiency guardrail: max cost-per-click. The pacer won't raise the bid if recent CPC exceeds this. Leave empty to disable."),
     efficiency_window_days: str = Field(default="7", description="Trailing days used to measure recent CPL/CPC for the efficiency guardrail"),
+    intraday_enabled: str = Field(default="true", description="Also nudge the bid during the active window when today is falling behind pace (in addition to the daily morning run)"),
+    intraday_max_change_pct: str = Field(default="10", description="Max % the bid may move per intraday run (gentler than the daily run)"),
+    intraday_max_daily_raises: str = Field(default="6", description="Cap on intraday raises per day to avoid runaway bidding"),
     timezone: str = Field(default="America/New_York", description="Timezone used to determine the day/month boundaries"),
     currency: str = Field(default="USD", description="Bid currency code"),
 ) -> str:
@@ -4213,6 +4443,9 @@ async def add_bid_pacing_rule(
             "max_cpc": float(max_cpc) if max_cpc else 0.0,
             "efficiency_window_days": int(efficiency_window_days) if efficiency_window_days else 7,
             "detect_ceiling": True,
+            "intraday_enabled": str(intraday_enabled).strip().lower() in ("true", "1", "yes"),
+            "intraday_max_change_pct": float(intraday_max_change_pct) if intraday_max_change_pct else 10.0,
+            "intraday_max_daily_raises": int(intraday_max_daily_raises) if intraday_max_daily_raises else 6,
             "timezone": timezone,
             "currency": currency,
             "enabled": True,
@@ -4279,19 +4512,23 @@ async def list_bid_pacing_rules(
 @mcp.tool()
 async def run_bid_pacer(
     dry_run: str = Field(default="false", description="If 'true', compute and report recommendations WITHOUT applying or logging changes."),
+    mode: str = Field(default="daily", description="'daily' = once-a-day reset off the prior full active day; 'intraday' = catch-up vs today's expected pace within the active window."),
 ) -> str:
     """
     Run the automated bid pacer over all configured rules.
 
-    For each rule: pulls the prior full day's campaign spend and month-to-date
-    account spend, computes a new manual bid that paces toward the daily budget
-    (throttled by the monthly account cap), applies it within guardrails, and
-    logs the change to bid_pacing_history.json. Use dry_run='true' to preview.
+    daily mode: pulls the prior full active day's spend + month-to-date account
+    spend and paces toward the daily budget (throttled by the monthly cap).
+    intraday mode: compares today's spend-so-far to what should be spent by now
+    (budget x fraction of active window elapsed) and gently raises if behind.
+    Applies within guardrails and logs to bid_pacing_history.json. dry_run='true'
+    previews only.
     """
     try:
         is_dry = str(dry_run).strip().lower() in ("true", "1", "yes")
-        summary = _run_bid_pacer_engine(dry_run=is_dry)
-        lines = [f"Bid Pacer Run {'(DRY RUN)' if is_dry else ''} — {summary['ran_at']}"]
+        run_mode = "intraday" if str(mode).strip().lower() == "intraday" else "daily"
+        summary = _run_bid_pacer_engine(dry_run=is_dry, mode=run_mode)
+        lines = [f"Bid Pacer Run [{run_mode}] {'(DRY RUN)' if is_dry else ''} — {summary['ran_at']}"]
         lines.append("=" * 100)
         if not summary["results"]:
             lines.append("No rules configured. Add one with add_bid_pacing_rule.")
@@ -4414,18 +4651,42 @@ def _build_pacing_snapshot(account_id: str) -> dict:
             continue
         sched = _schedule_for_campaign(account_id, cid)
         baseline = _recent_full_active_day(sched, today)
+        today_spend_c = round(spend.get(today.isoformat(), 0.0), 2)
+        daily_budget_c = float(r.get("daily_budget") or cfg["daily_budget"] or 0)
+        # Live intraday forecast (current pace vs suggested) — Shape-style decision row
+        forecast = {}
+        try:
+            dec = _evaluate_intraday_rule(r, now=now)
+            frac = dec.get("window_fraction") or 0
+            projected_eod = round(today_spend_c / frac, 2) if frac and frac > 0.05 else None
+            forecast = {
+                "window_fraction": frac,
+                "expected_so_far": dec.get("expected_so_far"),
+                "projected_eod_spend": projected_eod,
+                "on_pace": (today_spend_c >= (dec.get("expected_so_far") or 0) * 0.95),
+                "suggested_bid": dec.get("recommended_bid"),
+                "suggested_pct": dec.get("pct_change"),
+                "suggests_change": dec.get("will_change", False),
+                "recommendation": dec.get("reason", ""),
+                "efficiency_blocked": dec.get("efficiency_blocked", False),
+                "recent_cpl": dec.get("recent_cpl"),
+                "recent_cpc": dec.get("recent_cpc"),
+            }
+        except Exception:
+            forecast = {}
         campaigns.append({
             "campaign_id": cid,
             "campaign_name": cfg["name"],
             "current_bid": round(cfg["bid"], 2),
-            "daily_budget": float(r.get("daily_budget") or cfg["daily_budget"] or 0),
-            "today_spend": round(spend.get(today.isoformat(), 0.0), 2),
+            "daily_budget": daily_budget_c,
+            "today_spend": today_spend_c,
             "prior_day_spend": round(spend.get(baseline.isoformat(), 0.0), 2),
             "baseline_day": baseline.isoformat(),
             "scheduled": bool(sched),
             "today_active": len(_active_hours_for_day(sched, today)) > 0,
             "spend_by_date": {k: round(v, 2) for k, v in sorted(spend.items())},
             "enabled": r.get("enabled", True),
+            "forecast": forecast,
         })
 
     return {

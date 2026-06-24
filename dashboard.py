@@ -997,14 +997,19 @@ start_background_scheduler()
 BID_PACER_ENABLED = os.environ.get("BID_PACER_ENABLED", "true").lower() == "true"
 BID_PACER_RUN_HOUR = int(os.environ.get("BID_PACER_RUN_HOUR", "9"))
 BID_PACER_TIMEZONE = os.environ.get("BID_PACER_TIMEZONE", "America/New_York")
-BID_PACER_CHECK_INTERVAL = int(os.environ.get("BID_PACER_CHECK_MINUTES", "15")) * 60
+BID_PACER_CHECK_INTERVAL = int(os.environ.get("BID_PACER_CHECK_MINUTES", "20")) * 60
+# Intraday catch-up: re-check during the active window and nudge the bid if behind
+BID_PACER_INTRADAY = os.environ.get("BID_PACER_INTRADAY", "true").lower() == "true"
 
 _bid_pacer_state = {
     "enabled": BID_PACER_ENABLED,
+    "intraday": BID_PACER_INTRADAY,
     "run_hour": BID_PACER_RUN_HOUR,
     "timezone": BID_PACER_TIMEZONE,
     "last_run": None,
     "last_run_date": None,
+    "last_intraday_run": None,
+    "last_intraday_hour": None,
 }
 
 
@@ -1017,32 +1022,46 @@ def _pacer_today_str():
 
 
 def _bid_pacer_loop():
-    """Run the bid pacer once per day after BID_PACER_RUN_HOUR (in BID_PACER_TIMEZONE)."""
+    """Daily reset after BID_PACER_RUN_HOUR, plus an hourly intraday catch-up pass
+    during each campaign's active window (all in BID_PACER_TIMEZONE)."""
     try:
         from zoneinfo import ZoneInfo
     except ImportError:
         from backports.zoneinfo import ZoneInfo
-    logger.info("Background bid pacer started (run_hour=%d %s, enabled=%s)",
-                BID_PACER_RUN_HOUR, BID_PACER_TIMEZONE, BID_PACER_ENABLED)
+    logger.info("Background bid pacer started (run_hour=%d %s, enabled=%s, intraday=%s)",
+                BID_PACER_RUN_HOUR, BID_PACER_TIMEZONE, BID_PACER_ENABLED, BID_PACER_INTRADAY)
     while True:
         try:
             if BID_PACER_ENABLED:
                 now = datetime.now(ZoneInfo(BID_PACER_TIMEZONE))
                 today = now.date().isoformat()
+                has_rules = bool(li._load_bid_pacing_rules().get("rules"))
+
+                # 1) Daily reset — once per day
                 if now.hour >= BID_PACER_RUN_HOUR and _bid_pacer_state["last_run_date"] != today:
-                    if li._load_bid_pacing_rules().get("rules"):
-                        logger.info("Bid pacer daily run starting...")
-                        summary = li._run_bid_pacer_engine(dry_run=False)
-                        logger.info("Bid pacer processed %d rule(s).", summary.get("rules_processed", 0))
+                    if has_rules:
+                        logger.info("Bid pacer DAILY run starting...")
+                        s = li._run_bid_pacer_engine(dry_run=False, mode="daily")
+                        logger.info("Bid pacer daily processed %d rule(s).", s.get("rules_processed", 0))
                     _bid_pacer_state["last_run"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
                     _bid_pacer_state["last_run_date"] = today
+
+                # 2) Intraday catch-up — at most once per clock hour
+                if BID_PACER_INTRADAY and has_rules:
+                    hour_stamp = f"{today}T{now.hour:02d}"
+                    if _bid_pacer_state["last_intraday_hour"] != hour_stamp:
+                        logger.info("Bid pacer INTRADAY run starting...")
+                        s = li._run_bid_pacer_engine(dry_run=False, mode="intraday")
+                        _bid_pacer_state["last_intraday_run"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                        _bid_pacer_state["last_intraday_hour"] = hour_stamp
+                        logger.info("Bid pacer intraday processed %d rule(s).", s.get("rules_processed", 0))
         except Exception as e:
             logger.exception("Bid pacer loop failed: %s", e)
         time.sleep(BID_PACER_CHECK_INTERVAL)
 
 
 def start_bid_pacer():
-    """Start the daily bid pacer in a daemon thread."""
+    """Start the bid pacer (daily + intraday) in a daemon thread."""
     t = threading.Thread(target=_bid_pacer_loop, daemon=True)
     t.start()
 
@@ -1110,13 +1129,16 @@ def api_bid_pacing_delete(campaign_id):
 @app.route("/api/bid-pacing/run", methods=["POST"])
 @requires_auth
 def api_bid_pacing_run():
-    """Run the pacer now. Pass {"dry_run": true} to preview without applying."""
+    """Run the pacer now. Body: {"dry_run": bool, "mode": "daily"|"intraday"}."""
     try:
-        dry = bool((request.json or {}).get("dry_run", False))
-        summary = li._run_bid_pacer_engine(dry_run=dry)
-        _bid_pacer_state["last_run"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        body = request.json or {}
+        dry = bool(body.get("dry_run", False))
+        mode = "intraday" if str(body.get("mode", "daily")).lower() == "intraday" else "daily"
+        summary = li._run_bid_pacer_engine(dry_run=dry, mode=mode)
         if not dry:
-            _bid_pacer_state["last_run_date"] = _pacer_today_str()
+            _bid_pacer_state["last_run"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            if mode == "daily":
+                _bid_pacer_state["last_run_date"] = _pacer_today_str()
         return jsonify(summary)
     except Exception as e:
         logger.exception("Bid pacer run failed: %s", e)

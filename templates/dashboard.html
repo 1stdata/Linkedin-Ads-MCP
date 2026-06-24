@@ -399,13 +399,17 @@
   <div class="section">
     <div class="section-title">Bid Pacing</div>
     <div class="scheduler-panel">
-      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:12px">
-        <button class="btn btn-primary" id="runPacerBtn" onclick="runBidPacer(false)">Run Pacer Now</button>
-        <button class="btn btn-outline" id="previewPacerBtn" onclick="runBidPacer(true)">Preview (dry run)</button>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+        <button class="btn btn-primary" id="runPacerBtn" onclick="runBidPacer(false,'intraday')">Run Intraday Now</button>
+        <button class="btn btn-outline" id="runDailyBtn" onclick="runBidPacer(false,'daily')">Run Daily Reset</button>
+        <button class="btn btn-outline" id="previewPacerBtn" onclick="runBidPacer(true,'intraday')">Preview</button>
         <span id="bidPacerStatus" class="schedule-info" style="font-size:13px"></span>
       </div>
 
-      <div id="pacingSummary" style="margin-bottom:16px;font-size:13px;color:var(--text-muted)">Loading account pacing…</div>
+      <div id="pacingSummary" style="margin-bottom:14px;font-size:13px;color:var(--text-muted)">Loading account pacing…</div>
+
+      <!-- Shape-style forecast / decision grid -->
+      <div id="pacingForecast" style="margin-bottom:16px"></div>
 
       <div id="pacerResults" class="scheduler-results" style="display:none;margin-bottom:16px"></div>
 
@@ -1332,8 +1336,10 @@ async function loadBidPacingStatus() {
   try {
     const s = await apiFetch("/api/bid-pacing/status");
     const last = s.last_run ? utcToEastern(s.last_run) : "never";
-    el.textContent = (s.enabled ? `Auto-runs daily after ${s.run_hour}:00 ${s.timezone}` : "Auto-run disabled")
-      + ` · last run: ${last}`;
+    const intra = s.last_intraday_run ? utcToEastern(s.last_intraday_run) : "never";
+    el.textContent = (s.enabled ? `Daily reset after ${s.run_hour}:00 ${s.timezone}` : "Auto-run disabled")
+      + (s.intraday ? ` · intraday catch-up hourly (last: ${intra})` : "")
+      + ` · daily last: ${last}`;
   } catch (e) { el.textContent = ""; }
 }
 
@@ -1394,7 +1400,49 @@ async function loadBidPacingSnapshot() {
         p.innerHTML = money(c.prior_day_spend) + `<div style="font-size:11px;color:var(--text-muted)">${c.baseline_day || ""}${off}</div>`;
       }
     });
+    renderPacingForecast(s);
   } catch (e) { sumEl.textContent = ""; }
+}
+
+// Shape-style decision grid: today's pace, projected end-of-day, and the suggested move
+function renderPacingForecast(s) {
+  const el = document.getElementById("pacingForecast");
+  if (!el) return;
+  const cams = (s.campaigns || []).filter(c => c.forecast && Object.keys(c.forecast).length);
+  if (!cams.length) { el.innerHTML = ""; return; }
+  const cards = cams.map(c => {
+    const f = c.forecast;
+    const budget = c.daily_budget || 0;
+    const todayPct = budget ? Math.min(c.today_spend / budget * 100, 100) : 0;
+    const expPct = budget ? Math.min((f.expected_so_far || 0) / budget * 100, 100) : 0;   // where we "should" be
+    const onPace = f.on_pace;
+    const barColor = onPace ? "var(--success,#2f9e57)" : "var(--danger,#d4493f)";
+    const projColor = (f.projected_eod_spend || 0) >= budget * 0.95 ? "var(--success,#2f9e57)" : "var(--danger,#d4493f)";
+    const action = f.suggests_change
+      ? `<span class="badge badge-active">Raise → ${money(f.suggested_bid)} (${f.suggested_pct>=0?'+':''}${f.suggested_pct}%)</span>`
+      : (f.efficiency_blocked ? '<span class="badge badge-paused">Capped on efficiency</span>'
+        : '<span class="badge badge-draft">Hold</span>');
+    const eff = (f.recent_cpl!=null||f.recent_cpc!=null)
+      ? `<span style="color:var(--text-muted)"> · CPL ${f.recent_cpl!=null?money(f.recent_cpl):'—'} / CPC ${f.recent_cpc!=null?money(f.recent_cpc):'—'}</span>` : '';
+    return `<div style="border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+        <strong style="font-size:13px">${esc(c.campaign_name || c.campaign_id)}</strong>
+        <span style="font-size:12px;color:var(--text-muted)">bid ${money(c.current_bid)} · ${Math.round((f.window_fraction||0)*100)}% of day elapsed</span>
+      </div>
+      <div style="position:relative;height:20px;background:var(--bg);border:1px solid var(--border);border-radius:5px;overflow:hidden">
+        <div style="position:absolute;left:0;top:0;bottom:0;width:${todayPct}%;background:${barColor}"></div>
+        <div title="expected by now" style="position:absolute;top:-2px;bottom:-2px;left:${expPct}%;width:2px;background:var(--text)"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted);margin-top:6px">
+        <span>Today ${money(c.today_spend)} / ${money(budget)} <span style="color:var(--text)">(should be ~${money(f.expected_so_far)})</span></span>
+        <span>Proj. EOD <strong style="color:${projColor}">${f.projected_eod_spend!=null?money(f.projected_eod_spend):'—'}</strong></span>
+      </div>
+      <div style="margin-top:8px;font-size:12px">${action}${eff}
+        <div style="color:var(--text-muted);margin-top:4px">${esc(f.recommendation || "")}</div>
+      </div>
+    </div>`;
+  }).join("");
+  el.innerHTML = `<div style="font-size:13px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px">Today's Pace & Forecast</div>${cards}`;
 }
 
 async function addBidPacingRule() {
@@ -1427,19 +1475,20 @@ async function removeBidPacingRule(accountId, campaignId) {
   } catch (e) { showError("Could not remove rule: " + e.message); }
 }
 
-async function runBidPacer(dryRun) {
-  const btn = document.getElementById(dryRun ? "previewPacerBtn" : "runPacerBtn");
+async function runBidPacer(dryRun, mode) {
+  mode = mode || "daily";
+  const btn = document.getElementById(dryRun ? "previewPacerBtn" : (mode === "intraday" ? "runPacerBtn" : "runDailyBtn"));
   const results = document.getElementById("pacerResults");
   setLoading(btn, true);
   results.style.display = "none";
   try {
-    const data = await apiFetch("/api/bid-pacing/run", { method: "POST", body: JSON.stringify({ dry_run: dryRun }) });
+    const data = await apiFetch("/api/bid-pacing/run", { method: "POST", body: JSON.stringify({ dry_run: dryRun, mode: mode }) });
     results.style.display = "block";
     const rows = data.results || [];
     if (!rows.length) {
       results.innerHTML = '<div class="result-item" style="color:var(--text-muted)">No rules configured.</div>';
     } else {
-      results.innerHTML = (dryRun ? '<div class="result-item" style="color:var(--text-muted)">Preview only — no changes applied.</div>' : '')
+      results.innerHTML = `<div class="result-item" style="color:var(--text-muted)">${mode === "intraday" ? "Intraday" : "Daily"} run${dryRun ? " · preview only — no changes applied" : ""}.</div>`
         + rows.map(d => {
         if (d.error) return `<div class="result-item"><span class="badge badge-draft">ERROR</span> ${esc(d.campaign_id)}: ${esc(d.error)}</div>`;
         if (d.skipped) return `<div class="result-item"><span class="badge badge-draft">SKIP</span> ${esc(d.campaign_id)}: ${esc(d.skipped)}</div>`;
