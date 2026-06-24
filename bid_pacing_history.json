@@ -1,0 +1,22 @@
+[
+  {
+    "timestamp": "2026-06-24T12:40:00",
+    "account_id": "513217390",
+    "campaign_id": "858420426",
+    "campaign_name": "TOF | Lead Generation | Field Guide | Document Ads (Manual Bidding)",
+    "old_bid": 17.07,
+    "new_bid": 25.0,
+    "pct_change": 46.5,
+    "prior_day_spend": 156.79,
+    "baseline_day": "2026-06-23",
+    "scheduled": false,
+    "daily_budget": 175.0,
+    "effective_daily_target": 175.0,
+    "mtd_account_spend": 1072.02,
+    "monthly_account_cap": 5000.0,
+    "reason": "Manual catch-up: today spent only $13.59 of $175 by midday; bid of $17.07 was losing auctions. Raised to recover daily pacing.",
+    "source": "manual",
+    "applied": true,
+    "error": ""
+  }
+]

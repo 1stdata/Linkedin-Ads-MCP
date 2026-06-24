@@ -3689,5 +3689,665 @@ async def set_campaign_budget(
 
 
 
+# ===========================================================================
+# Automated Bid Pacing
+# ---------------------------------------------------------------------------
+# Adjusts a campaign's MANUAL bid (unitCost) once per run so the campaign
+# paces toward its daily budget, while never letting the *account's* month
+# blow past a monthly cap. Auto-applies within guardrails (max % move per run,
+# floor/ceiling bid). Every change is written to bid_pacing_history.json.
+#
+# Control logic (runs best once per morning):
+#   target_daily      = min(daily_budget, monthly_remaining / days_left)
+#   factor            = clamp(target_daily / prior_full_day_spend,
+#                             1 - max_change, 1 + max_change)
+#   new_bid           = clamp(current_bid * factor, min_bid, max_bid)
+# Using the *previous complete day's* spend avoids reacting to noisy
+# intraday data. The monthly cap is evaluated at the ACCOUNT level.
+# ===========================================================================
+
+_BID_PACING_DATA_DIR = "/data" if os.environ.get("RAILWAY_ENVIRONMENT") else os.path.dirname(os.path.abspath(__file__))
+BID_PACING_RULES_FILE = os.path.join(_BID_PACING_DATA_DIR, "bid_pacing_rules.json")
+BID_PACING_HISTORY_FILE = os.path.join(_BID_PACING_DATA_DIR, "bid_pacing_history.json")
+
+# Day keys aligned with datetime.weekday() (0=Mon ... 6=Sun)
+_PACING_DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def _schedule_for_campaign(account_id: str, campaign_id: str):
+    """Return the weekday_only schedule rule for a campaign, or None if unscheduled.
+
+    Shares schedules.json with the dayparting scheduler so bid pacing and
+    pause/resume stay consistent.
+    """
+    for rule in _load_schedules().get("weekday_only", []):
+        if str(rule.get("campaign_id")) == str(campaign_id) and str(rule.get("account_id")) == str(account_id):
+            return rule
+    return None
+
+
+def _active_hours_for_day(sched: Optional[dict], d) -> list:
+    """Hours (0-23) a campaign is scheduled to run on date `d`.
+
+    No schedule -> all 24 hours. Supports both the per-day `hours` grid and the
+    legacy resume_time/pause_time weekday model (active Mon resume_time through
+    Fri pause_time, paused weekends).
+    """
+    if not sched:
+        return list(range(24))
+    wd = d.weekday()  # 0=Mon
+    if "hours" in sched:
+        return sorted(int(h) for h in sched["hours"].get(_PACING_DAY_KEYS[wd], []))
+    rt = int(str(sched.get("resume_time", "06:00")).split(":")[0])
+    pt = int(str(sched.get("pause_time", "18:00")).split(":")[0])
+    if wd >= 5:          # Sat, Sun
+        return []
+    if wd == 0:          # Mon — resumes during the day
+        return list(range(rt, 24))
+    if wd == 4:          # Fri — pauses during the day
+        return list(range(0, pt))
+    return list(range(24))  # Tue-Thu fully active
+
+
+def _max_active_hours(sched: Optional[dict], ref_date) -> int:
+    """Largest number of active hours on any weekday in the schedule (a 'full' day)."""
+    if not sched:
+        return 24
+    vals = [len(_active_hours_for_day(sched, ref_date - timedelta(days=i))) for i in range(7)]
+    return max(vals) if any(vals) else 24
+
+
+def _recent_full_active_day(sched: Optional[dict], today, lookback: int = 14):
+    """Most recent prior date that was a 'full' active day for this schedule.
+
+    Falls back to the most recent active day, then to plain yesterday. This is
+    the spend baseline: comparing against a day the campaign was actually
+    running full-out (not a weekend/off day or a partial start day).
+    """
+    if not sched:
+        return today - timedelta(days=1)
+    maxh = _max_active_hours(sched, today)
+    most_recent_active = None
+    for i in range(1, lookback + 1):
+        d = today - timedelta(days=i)
+        h = len(_active_hours_for_day(sched, d))
+        if h <= 0:
+            continue
+        if most_recent_active is None:
+            most_recent_active = d
+        if h >= maxh:
+            return d
+    return most_recent_active or (today - timedelta(days=1))
+
+
+def _active_days_remaining(sched: Optional[dict], today, next_month) -> int:
+    """Count days from today (inclusive) to month end the campaign is scheduled to run."""
+    n = 0
+    for i in range((next_month - today).days):
+        if len(_active_hours_for_day(sched, today + timedelta(days=i))) > 0:
+            n += 1
+    return n
+
+
+def _load_bid_pacing_rules() -> dict:
+    if not os.path.exists(BID_PACING_RULES_FILE):
+        return {"rules": []}
+    try:
+        with open(BID_PACING_RULES_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {"rules": []}
+
+
+def _save_bid_pacing_rules(data: dict) -> None:
+    with open(BID_PACING_RULES_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _load_bid_pacing_history() -> list:
+    if not os.path.exists(BID_PACING_HISTORY_FILE):
+        return []
+    try:
+        with open(BID_PACING_HISTORY_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return []
+
+
+def _append_bid_pacing_history(entry: dict) -> None:
+    hist = _load_bid_pacing_history()
+    hist.append(entry)
+    with open(BID_PACING_HISTORY_FILE, "w") as f:
+        json.dump(hist, f, indent=2)
+
+
+def _get_campaign_bid_and_budget(account_id: str, campaign_id: str) -> dict:
+    """Fetch a campaign's current manual bid (unitCost), daily budget, status, name."""
+    data = linkedin_api_request("GET", f"/adAccounts/{account_id}/adCampaigns/{campaign_id}")
+    if isinstance(data, dict) and "error" in data:
+        raise RuntimeError(data["error"])
+    bid = float((data.get("unitCost") or {}).get("amount", 0) or 0)
+    daily = float((data.get("dailyBudget") or {}).get("amount", 0) or 0)
+    return {
+        "bid": bid,
+        "daily_budget": daily,
+        "status": data.get("status", ""),
+        "name": data.get("name", campaign_id),
+        "currency": (data.get("unitCost") or {}).get("currencyCode", "USD"),
+    }
+
+
+def _fetch_campaign_spend_by_date(account_id: str, campaign_id: str, start_date: str, end_date: str) -> dict:
+    """Return {YYYY-MM-DD: cost} for a campaign over a date range."""
+    params = _build_analytics_params(
+        account_id=account_id, pivot="CAMPAIGN", start_date=start_date,
+        end_date=end_date, time_granularity="DAILY", campaign_ids=[campaign_id],
+    )
+    elements = linkedin_paginated_request("/adAnalytics", params=params)
+    by_date: dict = {}
+    for el in elements:
+        dr = (el.get("dateRange") or {}).get("start") or {}
+        if dr:
+            d = f"{dr.get('year')}-{int(dr.get('month', 1)):02d}-{int(dr.get('day', 1)):02d}"
+            by_date[d] = by_date.get(d, 0.0) + float(el.get("costInLocalCurrency", 0) or 0)
+    return by_date
+
+
+def _fetch_account_spend(account_id: str, start_date: str, end_date: str) -> float:
+    """Return total account spend over a date range (all campaigns)."""
+    params = _build_analytics_params(
+        account_id=account_id, pivot="ACCOUNT", start_date=start_date,
+        end_date=end_date, time_granularity="ALL",
+    )
+    elements = linkedin_paginated_request("/adAnalytics", params=params)
+    total = 0.0
+    for el in elements:
+        total += float(el.get("costInLocalCurrency", 0) or 0)
+    return total
+
+
+def _evaluate_bid_rule(rule: dict, now=None) -> dict:
+    """Compute a bid recommendation for one rule. No side effects (no API write)."""
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:  # pragma: no cover
+        from backports.zoneinfo import ZoneInfo
+
+    tz_name = rule.get("timezone", "America/New_York")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz, tz_name = ZoneInfo("UTC"), "UTC"
+    now = now or datetime.now(tz)
+
+    account_id = str(rule["account_id"])
+    campaign_id = str(rule["campaign_id"])
+    currency = rule.get("currency", "USD")
+
+    cfg = _get_campaign_bid_and_budget(account_id, campaign_id)
+    current_bid = cfg["bid"]
+    daily_budget = float(rule.get("daily_budget") or cfg["daily_budget"] or 0)
+
+    today = now.date()
+    month_start = today.replace(day=1)
+    if today.month == 12:
+        next_month = today.replace(year=today.year + 1, month=1, day=1)
+    else:
+        next_month = today.replace(month=today.month + 1, day=1)
+
+    # --- Schedule awareness (shares schedules.json with the dayparting scheduler) ---
+    sched = _schedule_for_campaign(account_id, campaign_id)
+    today_is_active = len(_active_hours_for_day(sched, today)) > 0
+    baseline_day = _recent_full_active_day(sched, today)
+    # Monthly cap is spread over ACTIVE days remaining, not calendar days
+    days_remaining = _active_days_remaining(sched, today, next_month)
+    yday = baseline_day  # the day we compare against (last full active day)
+
+    camp_spend = _fetch_campaign_spend_by_date(account_id, campaign_id, baseline_day.isoformat(), today.isoformat())
+    prior_day_spend = camp_spend.get(baseline_day.isoformat(), 0.0)
+    today_spend = camp_spend.get(today.isoformat(), 0.0)
+
+    monthly_cap = float(rule.get("monthly_account_cap") or 0)
+    mtd_account = _fetch_account_spend(account_id, month_start.isoformat(), today.isoformat()) if monthly_cap else 0.0
+
+    max_change = float(rule.get("max_change_pct", 20)) / 100.0
+    min_bid = float(rule.get("min_bid", 0) or 0)
+    max_bid = float(rule.get("max_bid", 0) or 0)
+    min_change = float(rule.get("min_change_pct", 2))
+    target_ratio = float(rule.get("target_delivery_ratio", 0.95))
+
+    effective_daily = daily_budget
+    monthly_note = ""
+    if monthly_cap:
+        remaining = max(monthly_cap - mtd_account, 0.0)
+        allowed_daily = remaining / days_remaining if days_remaining > 0 else 0.0
+        if remaining <= 0:
+            effective_daily = 0.0
+            monthly_note = "monthly account cap reached"
+        elif allowed_daily < effective_daily:
+            effective_daily = allowed_daily
+            monthly_note = f"throttled by monthly cap (${remaining:.0f} left / {days_remaining}d)"
+
+    reason_parts = []
+    if sched and not today_is_active:
+        target_bid = current_bid
+        reason_parts.append("Campaign scheduled OFF today — holding bid (no spend expected)")
+    elif effective_daily <= 0:
+        target_bid = max(min_bid, current_bid * (1 - max_change))
+        reason_parts.append("Monthly account cap reached — lowering bid to floor")
+    elif prior_day_spend <= 0:
+        target_bid = current_bid
+        reason_parts.append("No prior full-day spend yet — holding bid")
+    else:
+        delivery_ratio = prior_day_spend / effective_daily if effective_daily else 1.0
+        desired_factor = effective_daily / prior_day_spend
+        factor = max(1 - max_change, min(1 + max_change, desired_factor))
+        if delivery_ratio < target_ratio:
+            target_bid = current_bid * factor
+            reason_parts.append(
+                f"Under-pacing: prior day ${prior_day_spend:.2f} = {delivery_ratio * 100:.0f}% of "
+                f"${effective_daily:.0f} target — raising bid {(factor - 1) * 100:+.1f}%")
+        elif prior_day_spend > effective_daily * 1.02:
+            target_bid = current_bid * factor
+            reason_parts.append(
+                f"Over-pacing: prior day ${prior_day_spend:.2f} > ${effective_daily:.0f} target — "
+                f"lowering bid {(factor - 1) * 100:+.1f}%")
+        else:
+            target_bid = current_bid
+            reason_parts.append(
+                f"On pace: prior day ${prior_day_spend:.2f} ≈ ${effective_daily:.0f} target — holding")
+    if monthly_note:
+        reason_parts.append(monthly_note)
+
+    if max_bid:
+        target_bid = min(target_bid, max_bid)
+    if min_bid:
+        target_bid = max(target_bid, min_bid)
+    target_bid = round(target_bid, 2)
+
+    pct_change = ((target_bid - current_bid) / current_bid * 100) if current_bid else 0.0
+    will_change = abs(pct_change) >= min_change
+
+    return {
+        "account_id": account_id,
+        "campaign_id": campaign_id,
+        "campaign_name": cfg["name"],
+        "timezone": tz_name,
+        "currency": currency,
+        "evaluated_at": now.isoformat(timespec="seconds"),
+        "current_bid": round(current_bid, 2),
+        "recommended_bid": target_bid,
+        "pct_change": round(pct_change, 1),
+        "daily_budget": round(daily_budget, 2),
+        "effective_daily_target": round(effective_daily, 2),
+        "prior_day": yday.isoformat(),
+        "prior_day_spend": round(prior_day_spend, 2),
+        "today_spend": round(today_spend, 2),
+        "monthly_account_cap": round(monthly_cap, 2),
+        "mtd_account_spend": round(mtd_account, 2),
+        "days_remaining_in_month": days_remaining,
+        "scheduled": bool(sched),
+        "today_active": today_is_active,
+        "baseline_day": baseline_day.isoformat(),
+        "active_days_remaining": days_remaining,
+        "will_change": will_change,
+        "reason": "; ".join(reason_parts),
+        "guardrails": {"max_change_pct": max_change * 100, "min_bid": min_bid, "max_bid": max_bid},
+    }
+
+
+def _apply_bid(account_id: str, campaign_id: str, new_bid: float, currency: str = "USD"):
+    """Write a new manual bid (unitCost only — never touches bidStrategy)."""
+    body = {"patch": {"$set": {"unitCost": {"amount": str(new_bid), "currencyCode": currency}}}}
+    return linkedin_api_request(
+        "POST", f"/adAccounts/{account_id}/adCampaigns/{campaign_id}",
+        json_body=body, extra_headers={"X-RestLi-Method": "PARTIAL_UPDATE"},
+    )
+
+
+def _run_bid_pacer_engine(dry_run: bool = False) -> dict:
+    """Evaluate every pacing rule, apply changes within guardrails, log history.
+
+    Shared by the run_bid_pacer MCP tool and the standalone bid_pacer.py cron script.
+    """
+    rules = _load_bid_pacing_rules().get("rules", [])
+    results = []
+    for rule in rules:
+        if not rule.get("enabled", True):
+            results.append({"campaign_id": rule.get("campaign_id"), "skipped": "disabled"})
+            continue
+        try:
+            decision = _evaluate_bid_rule(rule)
+        except Exception as e:
+            results.append({"campaign_id": rule.get("campaign_id"), "error": str(e)})
+            continue
+
+        applied = False
+        if decision["will_change"] and not dry_run:
+            resp = _apply_bid(decision["account_id"], decision["campaign_id"],
+                              decision["recommended_bid"], decision["currency"])
+            if isinstance(resp, dict) and "error" in resp:
+                decision["apply_error"] = resp["error"]
+            else:
+                applied = True
+        decision["applied"] = applied
+        decision["dry_run"] = dry_run
+
+        if (decision["will_change"] or decision.get("apply_error")) and not dry_run:
+            _append_bid_pacing_history({
+                "timestamp": decision["evaluated_at"],
+                "account_id": decision["account_id"],
+                "campaign_id": decision["campaign_id"],
+                "campaign_name": decision["campaign_name"],
+                "old_bid": decision["current_bid"],
+                "new_bid": decision["recommended_bid"] if applied else decision["current_bid"],
+                "pct_change": decision["pct_change"],
+                "prior_day_spend": decision["prior_day_spend"],
+                "baseline_day": decision.get("baseline_day", ""),
+                "scheduled": decision.get("scheduled", False),
+                "daily_budget": decision["daily_budget"],
+                "effective_daily_target": decision["effective_daily_target"],
+                "mtd_account_spend": decision["mtd_account_spend"],
+                "monthly_account_cap": decision["monthly_account_cap"],
+                "reason": decision["reason"],
+                "source": "auto-pacer" + ("/dry-run" if dry_run else ""),
+                "applied": applied,
+                "error": decision.get("apply_error", ""),
+            })
+        results.append(decision)
+    return {"ran_at": datetime.now().isoformat(timespec="seconds"),
+            "rules_processed": len(rules), "results": results}
+
+
+@mcp.tool()
+async def add_bid_pacing_rule(
+    account_id: str = Field(description="LinkedIn Ad Account ID"),
+    campaign_id: str = Field(description="Campaign ID to auto-pace (manual-bid campaigns only)"),
+    daily_budget: str = Field(description="Daily budget the campaign should pace toward, e.g. '175'"),
+    monthly_account_cap: str = Field(default="", description="Account-level monthly spend cap, e.g. '5000'. Pacing throttles so the account month does not exceed this. Leave empty to pace to daily budget only."),
+    campaign_name: str = Field(default="", description="Campaign name (reference only)"),
+    max_change_pct: str = Field(default="20", description="Max % the bid may move in a single run (guardrail)"),
+    min_bid: str = Field(default="", description="Floor bid — pacer never goes below this"),
+    max_bid: str = Field(default="", description="Ceiling bid — pacer never goes above this"),
+    min_change_pct: str = Field(default="2", description="Ignore tiny adjustments smaller than this %"),
+    target_delivery_ratio: str = Field(default="0.95", description="Fraction of daily target the prior day should hit before the bid is considered 'on pace'"),
+    timezone: str = Field(default="America/New_York", description="Timezone used to determine the day/month boundaries"),
+    currency: str = Field(default="USD", description="Bid currency code"),
+) -> str:
+    """
+    Register a campaign for automated manual-bid pacing.
+
+    The pacer raises the bid when the campaign under-delivers its daily budget
+    and lowers it (or holds) when on pace, while throttling so the *account's*
+    month never exceeds monthly_account_cap. Changes auto-apply within the
+    max_change_pct / min_bid / max_bid guardrails. Run it with `run_bid_pacer`
+    (or the standalone bid_pacer.py via cron).
+    """
+    try:
+        data = _load_bid_pacing_rules()
+        for r in data["rules"]:
+            if r["campaign_id"] == str(campaign_id) and r["account_id"] == str(account_id):
+                return f"Campaign {campaign_id} already has a bid-pacing rule. Remove it first to change settings."
+        rule = {
+            "account_id": str(account_id),
+            "campaign_id": str(campaign_id),
+            "campaign_name": campaign_name,
+            "daily_budget": float(daily_budget),
+            "monthly_account_cap": float(monthly_account_cap) if monthly_account_cap else 0.0,
+            "max_change_pct": float(max_change_pct),
+            "min_bid": float(min_bid) if min_bid else 0.0,
+            "max_bid": float(max_bid) if max_bid else 0.0,
+            "min_change_pct": float(min_change_pct),
+            "target_delivery_ratio": float(target_delivery_ratio),
+            "timezone": timezone,
+            "currency": currency,
+            "enabled": True,
+            "added_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        data["rules"].append(rule)
+        _save_bid_pacing_rules(data)
+        lines = [f"Bid-pacing rule added for campaign {campaign_id}."]
+        lines.append(f"  Daily budget target: {daily_budget} {currency}")
+        lines.append(f"  Monthly account cap: {monthly_account_cap or 'none'}")
+        lines.append(f"  Guardrails: max {max_change_pct}%/run, floor {min_bid or 'none'}, ceiling {max_bid or 'none'}")
+        lines.append(f"  Timezone: {timezone}")
+        lines.append("\nRun `run_bid_pacer` to evaluate now, or schedule bid_pacer.py via cron:")
+        lines.append(f"  0 9 * * * cd {os.path.dirname(os.path.abspath(__file__))} && python bid_pacer.py")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error adding bid-pacing rule: {str(e)}"
+
+
+@mcp.tool()
+async def remove_bid_pacing_rule(
+    account_id: str = Field(description="LinkedIn Ad Account ID"),
+    campaign_id: str = Field(description="Campaign ID to stop auto-pacing"),
+) -> str:
+    """Remove a campaign's automated bid-pacing rule."""
+    try:
+        data = _load_bid_pacing_rules()
+        before = len(data["rules"])
+        data["rules"] = [r for r in data["rules"]
+                         if not (r["campaign_id"] == str(campaign_id) and r["account_id"] == str(account_id))]
+        if len(data["rules"]) == before:
+            return f"No bid-pacing rule found for campaign {campaign_id}."
+        _save_bid_pacing_rules(data)
+        return f"Bid-pacing rule removed for campaign {campaign_id}."
+    except Exception as e:
+        return f"Error removing bid-pacing rule: {str(e)}"
+
+
+@mcp.tool()
+async def list_bid_pacing_rules(
+    format: str = Field(default="table", description="Output format: 'table', 'json', or 'csv'"),
+) -> str:
+    """List all campaigns with automated bid-pacing rules."""
+    try:
+        rules = _load_bid_pacing_rules().get("rules", [])
+        if not rules:
+            return "No bid-pacing rules configured."
+        rows = [{
+            "account_id": r.get("account_id", ""),
+            "campaign_id": r.get("campaign_id", ""),
+            "campaign_name": (r.get("campaign_name", "") or "")[:40],
+            "daily_budget": r.get("daily_budget", ""),
+            "monthly_cap": r.get("monthly_account_cap", "") or "none",
+            "max_change_pct": r.get("max_change_pct", ""),
+            "min_bid": r.get("min_bid", "") or "none",
+            "max_bid": r.get("max_bid", "") or "none",
+            "enabled": r.get("enabled", True),
+        } for r in rules]
+        return "Bid-Pacing Rules:\n" + "=" * 100 + "\n" + format_output(rows, format_type=format)
+    except Exception as e:
+        return f"Error listing bid-pacing rules: {str(e)}"
+
+
+@mcp.tool()
+async def run_bid_pacer(
+    dry_run: str = Field(default="false", description="If 'true', compute and report recommendations WITHOUT applying or logging changes."),
+) -> str:
+    """
+    Run the automated bid pacer over all configured rules.
+
+    For each rule: pulls the prior full day's campaign spend and month-to-date
+    account spend, computes a new manual bid that paces toward the daily budget
+    (throttled by the monthly account cap), applies it within guardrails, and
+    logs the change to bid_pacing_history.json. Use dry_run='true' to preview.
+    """
+    try:
+        is_dry = str(dry_run).strip().lower() in ("true", "1", "yes")
+        summary = _run_bid_pacer_engine(dry_run=is_dry)
+        lines = [f"Bid Pacer Run {'(DRY RUN)' if is_dry else ''} — {summary['ran_at']}"]
+        lines.append("=" * 100)
+        if not summary["results"]:
+            lines.append("No rules configured. Add one with add_bid_pacing_rule.")
+            return "\n".join(lines)
+        for d in summary["results"]:
+            if "error" in d:
+                lines.append(f"  ERROR campaign {d.get('campaign_id')}: {d['error']}")
+                continue
+            if d.get("skipped"):
+                lines.append(f"  SKIP campaign {d.get('campaign_id')}: {d['skipped']}")
+                continue
+            arrow = "->" if d["applied"] else ("(would set)" if d["will_change"] else "(hold)")
+            lines.append(
+                f"  {d['campaign_name'][:38]} ({d['campaign_id']}): "
+                f"${d['current_bid']:.2f} {arrow} ${d['recommended_bid']:.2f} ({d['pct_change']:+.1f}%)")
+            lines.append(f"        prior day ${d['prior_day_spend']:.2f} / target ${d['effective_daily_target']:.2f} "
+                         f"| month ${d['mtd_account_spend']:.0f} of ${d['monthly_account_cap']:.0f} cap")
+            lines.append(f"        reason: {d['reason']}")
+            if d.get("apply_error"):
+                lines.append(f"        APPLY ERROR: {d['apply_error']}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error running bid pacer: {str(e)}"
+
+
+@mcp.tool()
+async def get_bid_pacing_history(
+    account_id: str = Field(default="", description="Filter by account ID (optional)"),
+    campaign_id: str = Field(default="", description="Filter by campaign ID (optional)"),
+    limit: str = Field(default="100", description="Max number of most-recent entries to return"),
+    format: str = Field(default="table", description="Output format: 'table', 'json', or 'csv'"),
+) -> str:
+    """
+    Return the log of bid changes made by the pacer (and seeded manual changes).
+
+    Each entry records timestamp, old/new bid, % change, the prior-day spend and
+    daily/monthly targets that drove it, and the reason.
+    """
+    try:
+        hist = _load_bid_pacing_history()
+        if account_id:
+            hist = [h for h in hist if str(h.get("account_id")) == str(account_id)]
+        if campaign_id:
+            hist = [h for h in hist if str(h.get("campaign_id")) == str(campaign_id)]
+        hist = sorted(hist, key=lambda h: h.get("timestamp", ""), reverse=True)
+        try:
+            n = int(limit)
+        except ValueError:
+            n = 100
+        hist = hist[:n]
+        if not hist:
+            return "No bid-pacing history yet."
+        if format.lower() == "json":
+            return json.dumps(hist, indent=2, default=str)
+        rows = [{
+            "timestamp": h.get("timestamp", ""),
+            "campaign": (h.get("campaign_name", "") or h.get("campaign_id", ""))[:30],
+            "old_bid": h.get("old_bid", ""),
+            "new_bid": h.get("new_bid", ""),
+            "pct": f"{h.get('pct_change', 0):+.1f}%",
+            "prior_day_spend": h.get("prior_day_spend", ""),
+            "mtd_account": h.get("mtd_account_spend", ""),
+            "applied": h.get("applied", ""),
+            "reason": (h.get("reason", "") or "")[:60],
+        } for h in hist]
+        return "Bid-Pacing History:\n" + "=" * 100 + "\n" + format_output(rows, format_type=format)
+    except Exception as e:
+        return f"Error getting bid-pacing history: {str(e)}"
+
+
+def _build_pacing_snapshot(account_id: str) -> dict:
+    """Sync snapshot for the budget-pacing dashboard (used by the MCP tool and
+    the Flask dashboard). Includes live bid/budget per rule, today's & prior
+    full-active-day spend, month-to-date account spend vs cap, schedule-aware
+    projection (over remaining ACTIVE days), and recent bid-change history."""
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:  # pragma: no cover
+        from backports.zoneinfo import ZoneInfo
+    rules = [r for r in _load_bid_pacing_rules().get("rules", [])
+             if str(r.get("account_id")) == str(account_id)]
+    tz_name = rules[0].get("timezone", "America/New_York") if rules else "America/New_York"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    now = datetime.now(tz)
+    today = now.date()
+    month_start = today.replace(day=1)
+    if today.month == 12:
+        next_month = today.replace(year=today.year + 1, month=1, day=1)
+    else:
+        next_month = today.replace(month=today.month + 1, day=1)
+    days_in_month = (next_month - month_start).days
+    day_of_month = today.day
+
+    monthly_cap = max((float(r.get("monthly_account_cap") or 0) for r in rules), default=0.0)
+    mtd_account = _fetch_account_spend(account_id, month_start.isoformat(), today.isoformat())
+
+    # Schedule-aware month projection: elapsed vs remaining ACTIVE days.
+    # Use the union schedule across rules (a day counts as active if any rule runs).
+    scheds = [_schedule_for_campaign(account_id, str(r["campaign_id"])) for r in rules]
+    def _any_active(d):
+        if not scheds:
+            return True
+        return any(len(_active_hours_for_day(s, d)) > 0 for s in scheds)
+    active_elapsed = sum(1 for i in range(day_of_month) if _any_active(month_start + timedelta(days=i)))
+    active_total = sum(1 for i in range(days_in_month) if _any_active(month_start + timedelta(days=i)))
+    projected = round(mtd_account / active_elapsed * active_total, 2) if active_elapsed else None
+
+    campaigns = []
+    for r in rules:
+        cid = str(r["campaign_id"])
+        try:
+            cfg = _get_campaign_bid_and_budget(account_id, cid)
+            spend = _fetch_campaign_spend_by_date(
+                account_id, cid, month_start.isoformat(), today.isoformat())
+        except Exception as e:
+            campaigns.append({"campaign_id": cid, "error": str(e)})
+            continue
+        sched = _schedule_for_campaign(account_id, cid)
+        baseline = _recent_full_active_day(sched, today)
+        campaigns.append({
+            "campaign_id": cid,
+            "campaign_name": cfg["name"],
+            "current_bid": round(cfg["bid"], 2),
+            "daily_budget": float(r.get("daily_budget") or cfg["daily_budget"] or 0),
+            "today_spend": round(spend.get(today.isoformat(), 0.0), 2),
+            "prior_day_spend": round(spend.get(baseline.isoformat(), 0.0), 2),
+            "baseline_day": baseline.isoformat(),
+            "scheduled": bool(sched),
+            "today_active": len(_active_hours_for_day(sched, today)) > 0,
+            "spend_by_date": {k: round(v, 2) for k, v in sorted(spend.items())},
+            "enabled": r.get("enabled", True),
+        })
+
+    return {
+        "generated_at": now.isoformat(timespec="seconds"),
+        "timezone": tz_name,
+        "account_id": str(account_id),
+        "day_of_month": day_of_month,
+        "days_in_month": days_in_month,
+        "active_days_elapsed": active_elapsed,
+        "active_days_total": active_total,
+        "month_progress_pct": round(day_of_month / days_in_month * 100, 1),
+        "monthly_cap": round(monthly_cap, 2),
+        "mtd_account_spend": round(mtd_account, 2),
+        "monthly_spend_pct": round(mtd_account / monthly_cap * 100, 1) if monthly_cap else None,
+        "projected_month_spend": projected,
+        "campaigns": campaigns,
+        "recent_history": sorted(_load_bid_pacing_history(),
+                                 key=lambda h: h.get("timestamp", ""), reverse=True)[:50],
+    }
+
+
+@mcp.tool()
+async def get_pacing_dashboard_data(
+    account_id: str = Field(description="LinkedIn Ad Account ID"),
+) -> str:
+    """
+    Return a JSON snapshot for the budget-pacing dashboard: each pacing rule's
+    live bid/budget, today's and prior-full-active-day spend, month-to-date
+    account spend vs cap, schedule-aware projection, and recent bid-change
+    history. Designed to be called by a dashboard/artifact.
+    """
+    try:
+        return json.dumps(_build_pacing_snapshot(account_id), indent=2, default=str)
+    except Exception as e:
+        return f"Error building pacing dashboard data: {str(e)}"
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")

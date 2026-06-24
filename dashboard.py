@@ -991,6 +991,168 @@ start_background_scheduler()
 
 
 # ---------------------------------------------------------------------------
+# Bid Pacing — config, background daily runner, and API routes
+# ---------------------------------------------------------------------------
+
+BID_PACER_ENABLED = os.environ.get("BID_PACER_ENABLED", "true").lower() == "true"
+BID_PACER_RUN_HOUR = int(os.environ.get("BID_PACER_RUN_HOUR", "9"))
+BID_PACER_TIMEZONE = os.environ.get("BID_PACER_TIMEZONE", "America/New_York")
+BID_PACER_CHECK_INTERVAL = int(os.environ.get("BID_PACER_CHECK_MINUTES", "15")) * 60
+
+_bid_pacer_state = {
+    "enabled": BID_PACER_ENABLED,
+    "run_hour": BID_PACER_RUN_HOUR,
+    "timezone": BID_PACER_TIMEZONE,
+    "last_run": None,
+    "last_run_date": None,
+}
+
+
+def _pacer_today_str():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(BID_PACER_TIMEZONE)).date().isoformat()
+    except Exception:
+        return datetime.utcnow().date().isoformat()
+
+
+def _bid_pacer_loop():
+    """Run the bid pacer once per day after BID_PACER_RUN_HOUR (in BID_PACER_TIMEZONE)."""
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+    logger.info("Background bid pacer started (run_hour=%d %s, enabled=%s)",
+                BID_PACER_RUN_HOUR, BID_PACER_TIMEZONE, BID_PACER_ENABLED)
+    while True:
+        try:
+            if BID_PACER_ENABLED:
+                now = datetime.now(ZoneInfo(BID_PACER_TIMEZONE))
+                today = now.date().isoformat()
+                if now.hour >= BID_PACER_RUN_HOUR and _bid_pacer_state["last_run_date"] != today:
+                    if li._load_bid_pacing_rules().get("rules"):
+                        logger.info("Bid pacer daily run starting...")
+                        summary = li._run_bid_pacer_engine(dry_run=False)
+                        logger.info("Bid pacer processed %d rule(s).", summary.get("rules_processed", 0))
+                    _bid_pacer_state["last_run"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                    _bid_pacer_state["last_run_date"] = today
+        except Exception as e:
+            logger.exception("Bid pacer loop failed: %s", e)
+        time.sleep(BID_PACER_CHECK_INTERVAL)
+
+
+def start_bid_pacer():
+    """Start the daily bid pacer in a daemon thread."""
+    t = threading.Thread(target=_bid_pacer_loop, daemon=True)
+    t.start()
+
+
+@app.route("/api/bid-pacing/rules")
+@requires_auth
+def api_bid_pacing_rules():
+    """List all bid-pacing rules."""
+    return jsonify(li._load_bid_pacing_rules().get("rules", []))
+
+
+@app.route("/api/bid-pacing/rules", methods=["POST"])
+@requires_auth
+def api_bid_pacing_add():
+    """Create or update a bid-pacing rule."""
+    try:
+        p = request.json or {}
+        acct = str(p.get("account_id", "")).strip()
+        cid = str(p.get("campaign_id", "")).strip()
+        if not acct or not cid:
+            return jsonify({"error": "account_id and campaign_id required"}), 400
+        data = li._load_bid_pacing_rules()
+        data["rules"] = [r for r in data["rules"]
+                         if not (str(r["campaign_id"]) == cid and str(r["account_id"]) == acct)]
+        data["rules"].append({
+            "account_id": acct,
+            "campaign_id": cid,
+            "campaign_name": p.get("campaign_name", ""),
+            "daily_budget": float(p.get("daily_budget") or 0),
+            "monthly_account_cap": float(p.get("monthly_account_cap") or 0),
+            "max_change_pct": float(p.get("max_change_pct") or 20),
+            "min_bid": float(p.get("min_bid") or 0),
+            "max_bid": float(p.get("max_bid") or 0),
+            "min_change_pct": float(p.get("min_change_pct") or 2),
+            "target_delivery_ratio": float(p.get("target_delivery_ratio") or 0.95),
+            "timezone": p.get("timezone", "America/New_York"),
+            "currency": p.get("currency", "USD"),
+            "enabled": bool(p.get("enabled", True)),
+            "added_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        })
+        li._save_bid_pacing_rules(data)
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.exception("Failed to add bid-pacing rule: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/bid-pacing/rules/<campaign_id>", methods=["DELETE"])
+@requires_auth
+def api_bid_pacing_delete(campaign_id):
+    """Remove a bid-pacing rule."""
+    acct = request.args.get("account_id", "")
+    data = li._load_bid_pacing_rules()
+    before = len(data["rules"])
+    data["rules"] = [r for r in data["rules"]
+                     if not (str(r["campaign_id"]) == str(campaign_id) and (not acct or str(r["account_id"]) == str(acct)))]
+    li._save_bid_pacing_rules(data)
+    return jsonify({"success": True, "removed": before - len(data["rules"])})
+
+
+@app.route("/api/bid-pacing/run", methods=["POST"])
+@requires_auth
+def api_bid_pacing_run():
+    """Run the pacer now. Pass {"dry_run": true} to preview without applying."""
+    try:
+        dry = bool((request.json or {}).get("dry_run", False))
+        summary = li._run_bid_pacer_engine(dry_run=dry)
+        _bid_pacer_state["last_run"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        if not dry:
+            _bid_pacer_state["last_run_date"] = _pacer_today_str()
+        return jsonify(summary)
+    except Exception as e:
+        logger.exception("Bid pacer run failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/bid-pacing/history")
+@requires_auth
+def api_bid_pacing_history():
+    """Return bid-change history, most recent first."""
+    hist = sorted(li._load_bid_pacing_history(), key=lambda h: h.get("timestamp", ""), reverse=True)
+    return jsonify(hist[:100])
+
+
+@app.route("/api/bid-pacing/status")
+@requires_auth
+def api_bid_pacing_status():
+    """Return bid pacer schedule/run state."""
+    return jsonify(_bid_pacer_state)
+
+
+@app.route("/api/bid-pacing/snapshot")
+@requires_auth
+def api_bid_pacing_snapshot():
+    """Return a live pacing snapshot (bids, spend, cap projection) for an account."""
+    acct = request.args.get("account_id", "")
+    if not acct:
+        return jsonify({"error": "account_id required"}), 400
+    try:
+        return jsonify(li._build_pacing_snapshot(acct))
+    except Exception as e:
+        logger.exception("Pacing snapshot failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+# Start the background bid pacer when the module is loaded (works with gunicorn)
+start_bid_pacer()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 

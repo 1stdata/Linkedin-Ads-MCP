@@ -1,0 +1,20 @@
+{
+  "rules": [
+    {
+      "account_id": "513217390",
+      "campaign_id": "858420426",
+      "campaign_name": "TOF | Lead Generation | Field Guide | Document Ads (Manual Bidding)",
+      "daily_budget": 175.0,
+      "monthly_account_cap": 5000.0,
+      "max_change_pct": 20.0,
+      "min_bid": 5.0,
+      "max_bid": 50.0,
+      "min_change_pct": 2.0,
+      "target_delivery_ratio": 0.95,
+      "timezone": "America/New_York",
+      "currency": "USD",
+      "enabled": true,
+      "added_at": "2026-06-24T12:40:00"
+    }
+  ]
+}

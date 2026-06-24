@@ -394,6 +394,62 @@
       </div>
     </div>
   </div>
+
+  <!-- Bid Pacing -->
+  <div class="section">
+    <div class="section-title">Bid Pacing</div>
+    <div class="scheduler-panel">
+      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:12px">
+        <button class="btn btn-primary" id="runPacerBtn" onclick="runBidPacer(false)">Run Pacer Now</button>
+        <button class="btn btn-outline" id="previewPacerBtn" onclick="runBidPacer(true)">Preview (dry run)</button>
+        <span id="bidPacerStatus" class="schedule-info" style="font-size:13px"></span>
+      </div>
+
+      <div id="pacingSummary" style="margin-bottom:16px;font-size:13px;color:var(--text-muted)">Loading account pacing…</div>
+
+      <div id="pacerResults" class="scheduler-results" style="display:none;margin-bottom:16px"></div>
+
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <span style="font-size:13px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em">Pacing Rules</span>
+        <button class="btn btn-sm btn-outline" onclick="loadBidPacing()">Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Campaign</th><th>Daily $</th><th>Monthly cap $</th><th>Current bid</th>
+              <th>Prior active-day spend</th><th>Guardrails</th><th>On</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="pacingRulesBody">
+            <tr><td colspan="8" style="color:var(--text-muted)">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div style="margin-top:14px;padding:12px;border:1px solid var(--border);border-radius:6px">
+        <div style="font-size:12px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:10px">Add / Update Rule</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+          <div><label style="display:block;font-size:11px;color:var(--text-muted)">Campaign ID</label><input id="paceCampaignId" type="text" placeholder="858420426" style="width:140px"></div>
+          <div><label style="display:block;font-size:11px;color:var(--text-muted)">Daily budget</label><input id="paceDaily" type="number" step="0.01" placeholder="175" style="width:90px"></div>
+          <div><label style="display:block;font-size:11px;color:var(--text-muted)">Monthly cap</label><input id="paceMonthly" type="number" step="1" placeholder="5000" style="width:100px"></div>
+          <div><label style="display:block;font-size:11px;color:var(--text-muted)">Max %/run</label><input id="paceMaxChange" type="number" step="1" value="20" style="width:80px"></div>
+          <div><label style="display:block;font-size:11px;color:var(--text-muted)">Floor bid</label><input id="paceMinBid" type="number" step="0.01" placeholder="5" style="width:80px"></div>
+          <div><label style="display:block;font-size:11px;color:var(--text-muted)">Ceiling bid</label><input id="paceMaxBid" type="number" step="0.01" placeholder="50" style="width:80px"></div>
+          <button class="btn btn-sm btn-primary" onclick="addBidPacingRule()">Add rule</button>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:8px">Bids auto-adjust toward the daily budget, throttled by the monthly account cap over remaining <em>active</em> (scheduled) days. Off-days are skipped automatically.</div>
+      </div>
+
+      <div style="margin-top:16px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <span style="font-size:13px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em">Bid Change History</span>
+          <button class="btn btn-sm btn-outline" onclick="loadBidPacingHistory()">Refresh</button>
+        </div>
+        <div id="bidPacingHistory" style="font-size:13px;max-height:320px;overflow-y:auto;color:var(--text-muted)">Loading...</div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- Schedule Modal -->
@@ -565,6 +621,7 @@ function onAccountChange() {
   campaignGroups = {};
   loadCampaignGroups();
   loadCampaigns();
+  loadBidPacingSnapshot();
 }
 
 // ---- Campaign Groups ----
@@ -1254,6 +1311,172 @@ async function runScheduler() {
   }
 }
 
+// ---- Bid Pacing ----
+function money(n) {
+  if (n === null || n === undefined || n === "") return "—";
+  const v = Number(n);
+  return "$" + v.toLocaleString(undefined, { minimumFractionDigits: v < 100 ? 2 : 0, maximumFractionDigits: 2 });
+}
+
+async function loadBidPacing() {
+  loadBidPacingStatus();
+  loadBidPacingRules();
+  loadBidPacingSnapshot();
+  loadBidPacingHistory();
+}
+
+async function loadBidPacingStatus() {
+  const el = document.getElementById("bidPacerStatus");
+  try {
+    const s = await apiFetch("/api/bid-pacing/status");
+    const last = s.last_run ? utcToEastern(s.last_run) : "never";
+    el.textContent = (s.enabled ? `Auto-runs daily after ${s.run_hour}:00 ${s.timezone}` : "Auto-run disabled")
+      + ` · last run: ${last}`;
+  } catch (e) { el.textContent = ""; }
+}
+
+async function loadBidPacingRules() {
+  const body = document.getElementById("pacingRulesBody");
+  try {
+    const rules = await apiFetch("/api/bid-pacing/rules");
+    if (!rules.length) {
+      body.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted)">No pacing rules yet. Add one below.</td></tr>';
+      return;
+    }
+    body.innerHTML = rules.map(r => {
+      const guard = `±${r.max_change_pct}%/run · ${money(r.min_bid)}–${money(r.max_bid)}`;
+      const on = r.enabled ? '<span class="badge badge-active">ON</span>' : '<span class="badge badge-paused">OFF</span>';
+      return `<tr>
+        <td>${esc(r.campaign_name || r.campaign_id)}<div style="font-size:11px;color:var(--text-muted)">${r.campaign_id}</div></td>
+        <td>${money(r.daily_budget)}</td>
+        <td>${r.monthly_account_cap ? money(r.monthly_account_cap) : "—"}</td>
+        <td data-bid="${r.campaign_id}">…</td>
+        <td data-prior="${r.campaign_id}">…</td>
+        <td style="font-size:12px;color:var(--text-muted)">${guard}</td>
+        <td>${on}</td>
+        <td><button class="btn btn-sm btn-danger" onclick="removeBidPacingRule('${r.account_id}','${r.campaign_id}')">Remove</button></td>
+      </tr>`;
+    }).join("");
+  } catch (e) {
+    body.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted)">Could not load rules.</td></tr>';
+  }
+}
+
+async function loadBidPacingSnapshot() {
+  const acct = getAccountId();
+  const sumEl = document.getElementById("pacingSummary");
+  if (!acct) { sumEl.textContent = ""; return; }
+  try {
+    const s = await apiFetch("/api/bid-pacing/snapshot?account_id=" + encodeURIComponent(acct));
+    if (s.error) { sumEl.textContent = ""; return; }
+    if (s.monthly_cap) {
+      const pct = Math.min(s.monthly_spend_pct || 0, 100);
+      const over = (s.projected_month_spend || 0) > s.monthly_cap;
+      const barColor = over ? "var(--danger,#d4493f)" : "var(--success,#2f9e57)";
+      sumEl.innerHTML =
+        `<div style="margin-bottom:6px"><strong>Account month-to-date:</strong> ${money(s.mtd_account_spend)} of ${money(s.monthly_cap)} cap `
+        + `· projected month-end <strong style="color:${barColor}">${money(s.projected_month_spend)}</strong> `
+        + `(${s.active_days_elapsed}/${s.active_days_total} active days)</div>`
+        + `<div style="height:18px;background:var(--bg);border:1px solid var(--border);border-radius:5px;overflow:hidden">`
+        + `<div style="height:100%;width:${pct}%;background:${barColor}"></div></div>`;
+    } else {
+      sumEl.textContent = "No monthly cap set on this account's rules.";
+    }
+    // Fill per-rule live bid / prior-day spend cells
+    (s.campaigns || []).forEach(c => {
+      const b = document.querySelector(`[data-bid="${c.campaign_id}"]`);
+      const p = document.querySelector(`[data-prior="${c.campaign_id}"]`);
+      if (b) b.textContent = money(c.current_bid);
+      if (p) {
+        const off = c.scheduled && !c.today_active ? ' <span class="badge badge-paused">off today</span>' : '';
+        p.innerHTML = money(c.prior_day_spend) + `<div style="font-size:11px;color:var(--text-muted)">${c.baseline_day || ""}${off}</div>`;
+      }
+    });
+  } catch (e) { sumEl.textContent = ""; }
+}
+
+async function addBidPacingRule() {
+  const acct = getAccountId();
+  const cid = document.getElementById("paceCampaignId").value.trim();
+  if (!acct || !cid) { showError("Select an account and enter a campaign ID."); return; }
+  const payload = {
+    account_id: acct,
+    campaign_id: cid,
+    daily_budget: document.getElementById("paceDaily").value || 0,
+    monthly_account_cap: document.getElementById("paceMonthly").value || 0,
+    max_change_pct: document.getElementById("paceMaxChange").value || 20,
+    min_bid: document.getElementById("paceMinBid").value || 0,
+    max_bid: document.getElementById("paceMaxBid").value || 0,
+  };
+  try {
+    const r = await apiFetch("/api/bid-pacing/rules", { method: "POST", body: JSON.stringify(payload) });
+    if (r.error) { showError(r.error); return; }
+    document.getElementById("paceCampaignId").value = "";
+    loadBidPacing();
+  } catch (e) { showError("Could not add rule: " + e.message); }
+}
+
+async function removeBidPacingRule(accountId, campaignId) {
+  try {
+    await apiFetch(`/api/bid-pacing/rules/${campaignId}?account_id=${encodeURIComponent(accountId)}`, { method: "DELETE" });
+    loadBidPacing();
+  } catch (e) { showError("Could not remove rule: " + e.message); }
+}
+
+async function runBidPacer(dryRun) {
+  const btn = document.getElementById(dryRun ? "previewPacerBtn" : "runPacerBtn");
+  const results = document.getElementById("pacerResults");
+  setLoading(btn, true);
+  results.style.display = "none";
+  try {
+    const data = await apiFetch("/api/bid-pacing/run", { method: "POST", body: JSON.stringify({ dry_run: dryRun }) });
+    results.style.display = "block";
+    const rows = data.results || [];
+    if (!rows.length) {
+      results.innerHTML = '<div class="result-item" style="color:var(--text-muted)">No rules configured.</div>';
+    } else {
+      results.innerHTML = (dryRun ? '<div class="result-item" style="color:var(--text-muted)">Preview only — no changes applied.</div>' : '')
+        + rows.map(d => {
+        if (d.error) return `<div class="result-item"><span class="badge badge-draft">ERROR</span> ${esc(d.campaign_id)}: ${esc(d.error)}</div>`;
+        if (d.skipped) return `<div class="result-item"><span class="badge badge-draft">SKIP</span> ${esc(d.campaign_id)}: ${esc(d.skipped)}</div>`;
+        const badge = d.applied ? '<span class="badge badge-active">APPLIED</span>'
+          : (d.will_change ? '<span class="badge badge-paused">WOULD SET</span>' : '<span class="badge badge-draft">HOLD</span>');
+        return `<div class="result-item">${badge} <strong>${esc(d.campaign_name)}</strong> `
+          + `${money(d.current_bid)} → ${money(d.recommended_bid)} (${d.pct_change >= 0 ? "+" : ""}${d.pct_change}%)`
+          + `<div style="color:var(--text-muted);font-size:12px">${esc(d.reason)}</div></div>`;
+      }).join("");
+    }
+    loadBidPacing();
+  } catch (e) {
+    showError("Pacer error: " + e.message);
+  } finally {
+    setLoading(btn, false);
+  }
+}
+
+async function loadBidPacingHistory() {
+  const el = document.getElementById("bidPacingHistory");
+  try {
+    const hist = await apiFetch("/api/bid-pacing/history");
+    if (!hist.length) {
+      el.innerHTML = '<span style="color:var(--text-muted)">No bid changes yet.</span>';
+      return;
+    }
+    el.innerHTML = hist.map(h => {
+      const up = (h.new_bid || 0) >= (h.old_bid || 0);
+      const arrow = up ? '<span class="badge badge-active">▲</span>' : '<span class="badge badge-paused">▼</span>';
+      const src = h.source ? `<span style="font-size:11px;color:var(--text-muted)"> ${esc(h.source)}</span>` : '';
+      return `<div style="padding:8px 0;border-bottom:1px solid var(--border)">
+        <div>${arrow} <strong>${esc(h.timestamp || "")}</strong> — ${esc(h.campaign_name || h.campaign_id || "")}${src}</div>
+        <div style="margin-left:16px">${money(h.old_bid)} → <strong>${money(h.new_bid)}</strong> (${(h.pct_change>=0?"+":"")}${h.pct_change}%) · prior-day ${money(h.prior_day_spend)}${h.applied===false?' · <em>not applied</em>':''}</div>
+        <div style="margin-left:16px;color:var(--text-muted);font-size:12px">${esc(h.reason || "")}</div>
+      </div>`;
+    }).join("");
+  } catch (e) {
+    el.innerHTML = '<span style="color:var(--text-muted)">Could not load history.</span>';
+  }
+}
+
 // ---- Init ----
 document.addEventListener("DOMContentLoaded", async () => {
   await loadAccounts();
@@ -1262,6 +1485,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   loadWeeklyReports();
   loadSchedulerStatus();
   loadSchedulerHistory();
+  loadBidPacing();
 });
 </script>
 </body>
