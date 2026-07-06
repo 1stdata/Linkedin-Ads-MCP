@@ -217,3 +217,23 @@ The app is on the Advertising API **Development tier**: read unlimited accounts,
 
 ## Hosting + dashboard (one Railway service)
 `server_http.py` runs both on `https://linkedin-ads-mcp-production-6593.up.railway.app`: `/mcp` (connector, `MCP_API_KEY`), `/health` (status JSON), and the **Flask scheduling dashboard at `/`** (UI + schedule editor + pause/resume run-history log at `/api/scheduler/history`), wrapped via `asgiref.WsgiToAsgi`. Root "Not Found" only means the dashboard isn't mounted — check `/health`. Protect the dashboard with `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD`; attach a Railway volume at `/data` so `schedules.json` + `scheduler_history.json` persist across deploys. Schedules set via MCP tools and via the dashboard share the same file.
+
+## Creating image ads — images MUST be server-side (read this first)
+
+This MCP runs on **Railway (remote)**. `create_single_image_ad`, `bulk_create_single_image_ads`
+and `upload_image` open `image_path`/`csv_path` on the **server's** disk — NOT your Mac. Local
+paths, sandbox paths, and https URLs all fail with `[Errno 2] No such file or directory` (the code
+does `open(path)`; it does not download URLs).
+
+**Working method (every time):**
+1. Commit the images into the repo's **`creatives/`** folder (read as `./creatives/x.png` from the
+   app dir; it is NOT gitignored and NOT on the `/data` volume).
+2. Commit a CSV at the repo root with `image_path` = `./creatives/x.png`
+   (columns: `image_path,intro_text,headline,call_to_action,destination_url`).
+3. `git push` → wait for Railway to redeploy (~1–2 min).
+4. `bulk_create_single_image_ads(account_id, campaign_id, csv_path="that.csv", status="DRAFT")`,
+   once per ad set. Same creatives in several ad sets = one CSV, run per `campaign_id`.
+
+Helper: `./deploy_creatives.sh <src images...>` copies them into `creatives/`, commits, and pushes.
+Full playbook + checklist: `docs/creating-image-ads.md`. Page URN = `urn:li:organization:40686922`.
+DRAFT only (PAUSED not allowed at create); attach the Lead Gen form in Campaign Manager afterward.
