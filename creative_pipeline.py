@@ -278,9 +278,7 @@ def create_link_post(owner_urn: str, image_urn: str, intro_text: str,
         "lifecycleState": "PUBLISHED",
         "isReshareDisabledByAuthor": True,
     }
-    resp = requests.post(f"{API_BASE}/posts", headers=_headers(token), json=body, timeout=60)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"create post failed ({resp.status_code}): {resp.text}")
+    resp = _post_with_media_retry(body, token, "create post")
     post_urn = _created_urn(resp)
     if not post_urn:
         raise RuntimeError(f"create post returned no x-restli-id. Body: {resp.text}")
@@ -322,13 +320,32 @@ def create_image_post(owner_urn: str, image_urn: str, intro_text: str,
         "lifecycleState": "PUBLISHED",
         "isReshareDisabledByAuthor": True,
     }
-    resp = requests.post(f"{API_BASE}/posts", headers=_headers(token), json=body, timeout=60)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"create image post failed ({resp.status_code}): {resp.text}")
+    resp = _post_with_media_retry(body, token, "create image post")
     post_urn = _created_urn(resp)
     if not post_urn:
         raise RuntimeError(f"create image post returned no x-restli-id. Body: {resp.text}")
     return post_urn
+
+
+def _post_with_media_retry(body: dict, token: Optional[str], label: str,
+                           attempts: int = 4, delay_s: int = 8) -> "requests.Response":
+    """POST /posts, retrying 404s.
+
+    A freshly uploaded image can take several seconds to process; referencing
+    it immediately in a post intermittently 404s ("Could not find entity").
+    Retrying after a short wait resolves it.
+    """
+    last = None
+    for i in range(attempts):
+        resp = requests.post(f"{API_BASE}/posts", headers=_headers(token), json=body, timeout=60)
+        if resp.status_code < 400:
+            return resp
+        last = resp
+        if resp.status_code == 404 and i < attempts - 1:
+            time.sleep(delay_s)
+            continue
+        break
+    raise RuntimeError(f"{label} failed ({last.status_code}): {last.text}")
 
 
 # ---------------------------------------------------------------------------
