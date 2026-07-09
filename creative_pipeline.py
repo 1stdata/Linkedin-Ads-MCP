@@ -35,6 +35,29 @@ from typing import Optional
 
 import requests
 
+
+def _load_dotenv_once() -> None:
+    """Best-effort .env loader (repo dir) so the CLI works from a fresh shell.
+
+    Only fills variables that aren't already exported — real env always wins.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except IOError:
+        pass
+
+
+_load_dotenv_once()
+
 API_BASE = "https://api.linkedin.com/rest"
 API_VERSION = os.environ.get("LINKEDIN_API_VERSION", "202605")
 DEFAULT_ORG_URN = os.environ.get("LINKEDIN_ORG_URN", "")
@@ -51,6 +74,11 @@ VALID_CTAS = {
 def get_token() -> str:
     """Resolve a LinkedIn access token from token file or env (matches the server)."""
     path = os.environ.get("LINKEDIN_TOKEN_PATH")
+    if path and not os.path.exists(path):
+        # relative token path (e.g. ./linkedin_token.json): also try repo dir
+        alt = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+        if os.path.exists(alt):
+            path = alt
     if path and os.path.exists(path):
         try:
             with open(path) as f:
@@ -260,6 +288,109 @@ def create_link_post(owner_urn: str, image_urn: str, intro_text: str,
 
 
 # ---------------------------------------------------------------------------
+# Step 2b — create the sponsored (dark) IMAGE post for lead-gen ads
+# ---------------------------------------------------------------------------
+def create_image_post(owner_urn: str, image_urn: str, intro_text: str,
+                      headline: str, account_id: str,
+                      token: Optional[str] = None) -> str:
+    """Create a Direct Sponsored Content image post (no article link).
+
+    Used for LEAD_GENERATION ads: the Lead Gen Form (set on the creative) is
+    the click destination, so the post carries only the image + copy. The
+    headline rides on content.media.title.
+    Returns the post URN (urn:li:share:... or urn:li:ugcPost:...).
+    """
+    body = {
+        "adContext": {
+            "dscAdAccount": f"urn:li:sponsoredAccount:{account_id}",
+            "dscStatus": "ACTIVE",
+        },
+        "author": owner_urn,
+        "commentary": intro_text,
+        "visibility": "PUBLIC",
+        "distribution": {
+            "feedDistribution": "NONE",
+            "targetEntities": [],
+            "thirdPartyDistributionChannels": [],
+        },
+        "content": {
+            "media": {
+                "title": headline,
+                "id": image_urn,
+            }
+        },
+        "lifecycleState": "PUBLISHED",
+        "isReshareDisabledByAuthor": True,
+    }
+    resp = requests.post(f"{API_BASE}/posts", headers=_headers(token), json=body, timeout=60)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"create image post failed ({resp.status_code}): {resp.text}")
+    post_urn = _created_urn(resp)
+    if not post_urn:
+        raise RuntimeError(f"create image post returned no x-restli-id. Body: {resp.text}")
+    return post_urn
+
+
+# ---------------------------------------------------------------------------
+# Lead Gen Forms — list / resolve
+# ---------------------------------------------------------------------------
+def _form_name(form: dict) -> str:
+    """Best-effort human name from a leadForms element (name may be localized)."""
+    name = form.get("name", "")
+    if isinstance(name, dict):
+        localized = name.get("localized") or {}
+        if isinstance(localized, dict) and localized:
+            return str(next(iter(localized.values())))
+        return str(name.get("value", "") or name)
+    return str(name)
+
+
+def list_lead_forms(account_id: str, token: Optional[str] = None) -> list:
+    """Return the account's Lead Gen Forms as [{id, urn, name, state}].
+
+    NOTE: /leadForms takes `owner` as a Restli UNION — it must be sent as
+    owner=(sponsoredAccount:urn%3Ali%3AsponsoredAccount%3A<id>), not as a bare
+    URN (a bare URN 400s with "union type is not backed by a DataMap").
+    """
+    from urllib.parse import quote
+    urn = f"urn:li:sponsoredAccount:{account_id}"
+    query = f"q=owner&owner=(sponsoredAccount:{quote(urn, safe='')})&count=100"
+    resp = requests.get(f"{API_BASE}/leadForms?{query}", headers=_headers(token), timeout=30)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"list leadForms failed ({resp.status_code}): {resp.text}")
+    out = []
+    for el in resp.json().get("elements", []):
+        fid = str(el.get("id", ""))
+        out.append({
+            "id": fid,
+            "urn": fid if fid.startswith("urn:") else f"urn:li:adForm:{fid}",
+            "name": _form_name(el),
+            "state": el.get("state", el.get("status", "")),
+        })
+    return out
+
+
+def resolve_lead_form(account_id: str, lead_form: str,
+                      token: Optional[str] = None) -> str:
+    """Turn a lead form reference (URN, bare ID, or name substring) into an adForm URN."""
+    s = str(lead_form).strip()
+    if s.startswith("urn:"):
+        return s
+    if s.isdigit():
+        return f"urn:li:adForm:{s}"
+    forms = list_lead_forms(account_id, token)
+    matches = [f for f in forms if s.lower() in f["name"].lower()]
+    if len(matches) == 1:
+        return matches[0]["urn"]
+    names = ", ".join(f'"{f["name"]}" ({f["id"]})' for f in forms) or "(none found)"
+    kind = "Ambiguous" if matches else "No"
+    raise ValueError(
+        f'{kind} lead form match for "{s}" on account {account_id}. '
+        f"Available forms: {names}. Pass the numeric form ID instead."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Step 3 — create the ad (sponsoredCreative) referencing the post
 # ---------------------------------------------------------------------------
 def create_creative(account_id: str, campaign_id: str, post_urn: str,
@@ -278,6 +409,87 @@ def create_creative(account_id: str, campaign_id: str, post_urn: str,
     if resp.status_code >= 400:
         raise RuntimeError(f"create creative failed ({resp.status_code}): {resp.text}")
     return _created_urn(resp) or resp.json().get("id", "unknown")
+
+
+# ---------------------------------------------------------------------------
+# Step 3b — create a LEAD GEN ad (creative + leadgenCallToAction -> form)
+# ---------------------------------------------------------------------------
+def create_leadgen_creative(account_id: str, campaign_id: str, post_urn: str,
+                            lead_form_urn: str, call_to_action: str = "DOWNLOAD",
+                            status: str = "DRAFT", token: Optional[str] = None) -> str:
+    """Create a lead-gen ad under a LEAD_GENERATION campaign.
+
+    The creative carries leadgenCallToAction pointing at the Lead Gen Form —
+    that (not a URL) is the click destination. Tries the documented
+    {"destination": ...} key first and falls back to {"destinationForm": ...}
+    if the API version rejects the field name (self-heals across versions).
+    """
+    cta = call_to_action.upper().strip() or "DOWNLOAD"
+    if cta not in VALID_CTAS:
+        cta = "LEARN_MORE"
+
+    def _body(dest_key: str) -> dict:
+        return {
+            "campaign": f"urn:li:sponsoredCampaign:{campaign_id}",
+            "intendedStatus": status.upper(),
+            "content": {"reference": post_urn},
+            "leadgenCallToAction": {dest_key: lead_form_urn, "label": cta},
+        }
+
+    last_err = ""
+    for dest_key in ("destination", "destinationForm"):
+        resp = requests.post(
+            f"{API_BASE}/adAccounts/{account_id}/creatives",
+            headers=_headers(token), json=_body(dest_key), timeout=60,
+        )
+        if resp.status_code < 400:
+            return _created_urn(resp) or resp.json().get("id", "unknown")
+        last_err = f"({resp.status_code}): {resp.text}"
+        # Only retry with the alternate key if the complaint is about the field
+        if not any(k in resp.text for k in ("destination", "leadgenCallToAction", "UNRECOGNIZED", "unrecognized")):
+            break
+    raise RuntimeError(f"create leadgen creative failed {last_err}")
+
+
+def create_lead_gen_image_ad(account_id: str, campaign_id: str, image_path: str,
+                             intro_text: str, headline: str, lead_form: str,
+                             call_to_action: str = "DOWNLOAD",
+                             owner_urn: Optional[str] = None, status: str = "DRAFT",
+                             token: Optional[str] = None) -> dict:
+    """Upload image → create dark IMAGE post → create lead-gen ad tied to a form.
+
+    lead_form accepts a urn:li:adForm:... URN, a bare numeric form ID, or a
+    form-name substring (resolved via list_lead_forms).
+    """
+    token = token or get_token()
+    owner = owner_urn or resolve_page_for_account(account_id, token)
+    form_urn = resolve_lead_form(account_id, lead_form, token)
+    image_urn = upload_image(image_path, owner, token)
+    post_urn = create_image_post(owner, image_urn, intro_text, headline,
+                                 account_id, token=token)
+    creative = create_leadgen_creative(account_id, campaign_id, post_urn,
+                                       form_urn, call_to_action, status, token)
+    return {"image_urn": image_urn, "post_urn": post_urn,
+            "creative": creative, "lead_form": form_urn}
+
+
+def create_bare_image_ad(account_id: str, campaign_id: str, image_path: str,
+                         intro_text: str, headline: str,
+                         owner_urn: Optional[str] = None, status: str = "DRAFT",
+                         token: Optional[str] = None) -> dict:
+    """Upload image → dark IMAGE post → plain creative, NO form and NO URL.
+
+    For LEAD_GENERATION ad sets when you want to draft the creative now and
+    attach the Lead Gen Form manually in Campaign Manager before launch.
+    """
+    token = token or get_token()
+    owner = owner_urn or resolve_page_for_account(account_id, token)
+    image_urn = upload_image(image_path, owner, token)
+    post_urn = create_image_post(owner, image_urn, intro_text, headline,
+                                 account_id, token=token)
+    creative = create_creative(account_id, campaign_id, post_urn,
+                               status=status, token=token)
+    return {"image_urn": image_urn, "post_urn": post_urn, "creative": creative}
 
 
 # ---------------------------------------------------------------------------
@@ -303,10 +515,20 @@ def create_single_image_ad(account_id: str, campaign_id: str, image_path: str,
 # Bulk — create many ads from a CSV
 # ---------------------------------------------------------------------------
 # CSV columns: image_path, intro_text, headline, call_to_action, destination_url
+#   Optional per-row column for LEAD_GENERATION campaigns: lead_form
+#   (adForm URN, numeric form ID, or form-name substring). When lead_form is
+#   set (or default_lead_form is passed), the row becomes a lead-gen ad and
+#   destination_url is ignored.
 def bulk_create_from_csv(account_id: str, campaign_id: str, csv_path: str,
                          owner_urn: Optional[str] = None, status: str = "DRAFT",
-                         token: Optional[str] = None) -> list:
-    """Create one single-image ad per CSV row. Returns a per-row result list."""
+                         token: Optional[str] = None,
+                         default_lead_form: Optional[str] = None,
+                         formless: bool = False) -> list:
+    """Create one single-image ad per CSV row. Returns a per-row result list.
+
+    formless=True: build every row as a bare image ad (no URL, no form) —
+    for drafting into LEAD_GENERATION ad sets and attaching forms in the UI.
+    """
     owner = owner_urn or DEFAULT_ORG_URN
     token = token or get_token()
     results = []
@@ -315,15 +537,43 @@ def bulk_create_from_csv(account_id: str, campaign_id: str, csv_path: str,
             img = (row.get("image_path") or "").strip()
             if not img:
                 continue
+            lead_form = (row.get("lead_form") or "").strip()
+            dest = (row.get("destination_url") or "").strip()
+            if not lead_form and not dest:
+                # default form only fills rows that don't declare a URL,
+                # so mixed CSVs keep their link rows as link ads
+                lead_form = (default_lead_form or "").strip()
             try:
-                out = create_single_image_ad(
-                    account_id, campaign_id, img,
-                    (row.get("intro_text") or "").strip(),
-                    (row.get("headline") or "").strip(),
-                    (row.get("destination_url") or "").strip(),
-                    (row.get("call_to_action") or "LEARN_MORE").strip(),
-                    owner, status, token,
-                )
+                if formless:
+                    out = create_bare_image_ad(
+                        account_id, campaign_id, img,
+                        (row.get("intro_text") or "").strip(),
+                        (row.get("headline") or "").strip(),
+                        owner, status, token,
+                    )
+                elif lead_form:
+                    out = create_lead_gen_image_ad(
+                        account_id, campaign_id, img,
+                        (row.get("intro_text") or "").strip(),
+                        (row.get("headline") or "").strip(),
+                        lead_form,
+                        (row.get("call_to_action") or "DOWNLOAD").strip(),
+                        owner, status, token,
+                    )
+                elif not dest:
+                    raise ValueError(
+                        "Row has neither destination_url nor lead_form — set one "
+                        "(lead_form for LEAD_GENERATION ad sets, destination_url otherwise)."
+                    )
+                else:
+                    out = create_single_image_ad(
+                        account_id, campaign_id, img,
+                        (row.get("intro_text") or "").strip(),
+                        (row.get("headline") or "").strip(),
+                        dest,
+                        (row.get("call_to_action") or "LEARN_MORE").strip(),
+                        owner, status, token,
+                    )
                 results.append({"row": i, "image": img, "ok": True, **out})
             except Exception as e:  # noqa: BLE001 - report and continue
                 results.append({"row": i, "image": img, "ok": False, "error": str(e)})

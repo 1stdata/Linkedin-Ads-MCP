@@ -102,6 +102,25 @@ to the closest valid CTA.
 `python bulk_create_ads.py --account <id> --campaign <id> --csv <file> --status DRAFT`
 runs the same pipeline without the MCP timeout (good for big batches).
 
+## Lead-gen ads (added July 2026)
+For **LEAD_GENERATION** ad sets the click destination is a Lead Gen Form, not a URL:
+- CSV: add a `lead_form` column (adForm URN, numeric form ID, or form-name
+  substring), or pass `--lead-form <ref>` as the default for all rows;
+  `destination_url` is ignored for those rows.
+- Discover forms: `python bulk_create_ads.py --account <id> --list-forms`, or the
+  `list_lead_forms` MCP tool.
+- Mechanics: the post is an **image post** (`content.media` — headline rides on
+  `media.title`, no article link) and the creative carries
+  `leadgenCallToAction: {destination: urn:li:adForm:<id>, label: <CTA>}`.
+  The pipeline auto-retries with `destinationForm` if the API version rejects
+  the `destination` key.
+- `/leadForms` takes `owner` as a Restli UNION —
+  `owner=(sponsoredAccount:urn%3Ali%3AsponsoredAccount%3A<id>)`; a bare URN 400s
+  with "union type is not backed by a DataMap".
+- MCP tools `create_single_image_ad` / `bulk_create_single_image_ads` accept
+  `lead_form` / `default_lead_form` too (server restart/redeploy required to pick
+  up the new params).
+
 ## Field notes — verified live (June 2026)
 
 **Authoritative docs (consult when unsure):** https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads/advertising-targeting/ads-targeting — and the sibling pages under .../integrations/ads/ (create-and-manage-campaigns, image-ads-integrations). Always match the current `li-lms-YYYY-MM` version.

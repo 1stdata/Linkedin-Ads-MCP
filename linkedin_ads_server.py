@@ -2463,9 +2463,13 @@ async def list_lead_forms(
         List of Lead Gen Forms.
     """
     try:
+        # /leadForms takes `owner` as a Restli UNION — it must be sent as
+        # owner=(sponsoredAccount:urn%3Ali%3AsponsoredAccount%3A<id>). A bare
+        # URN 400s with "union type is not backed by a DataMap".
+        from urllib.parse import quote as _quote
+        owner_urn = format_account_urn(account_id)
         params = {
-            "q": "owner",
-            "owner": format_account_urn(account_id),
+            "__raw_query": f"q=owner&owner=(sponsoredAccount:{_quote(owner_urn, safe='')})",
         }
         elements = linkedin_paginated_request("/leadForms", params=params)
 
@@ -2474,10 +2478,14 @@ async def list_lead_forms(
 
         rows = []
         for form in elements:
+            name = form.get("name", "N/A")
+            if isinstance(name, dict):
+                localized = name.get("localized") or {}
+                name = str(next(iter(localized.values()))) if localized else str(name.get("value", name))
             rows.append({
-                "id": extract_id_from_urn(form.get("id", "")),
-                "name": form.get("name", "N/A"),
-                "status": form.get("status", "N/A"),
+                "id": extract_id_from_urn(str(form.get("id", ""))),
+                "name": name,
+                "status": form.get("state", form.get("status", "N/A")),
                 "headline": form.get("headline", "N/A"),
                 "description": form.get("description", "N/A"),
                 "createdAt": epoch_ms_to_iso(form.get("createdAt", 0)),
@@ -3367,22 +3375,35 @@ async def create_single_image_ad(
     image_path: str = Field(description="Local path to the image file"),
     intro_text: str = Field(description="Introductory/post text (max ~600 chars)"),
     headline: str = Field(description="Headline shown under the image (max ~200 chars)"),
-    destination_url: str = Field(description="Landing page URL (https://...)"),
+    destination_url: str = Field(default="", description="Landing page URL (https://...). Required unless lead_form is set."),
     call_to_action: str = Field(default="LEARN_MORE", description="CTA: LEARN_MORE, REQUEST_DEMO, SIGN_UP, DOWNLOAD, REGISTER, ..."),
     owner_org_urn: str = Field(default="", description="Organization (Page) URN. Defaults to LINKEDIN_ORG_URN."),
     status: str = Field(default="DRAFT", description="DRAFT (safe, no spend), ACTIVE (goes to review), or PAUSED (only after approved)"),
+    lead_form: str = Field(default="", description="Lead Gen Form (adForm URN, numeric ID, or name substring) for LEAD_GENERATION ad sets. When set, the ad clicks open this form and destination_url is ignored."),
 ) -> str:
-    """Create a complete single-image ad: uploads the image, creates the sponsored post, and creates the ad."""
+    """Create a complete single-image ad: uploads the image, creates the sponsored post, and creates the ad.
+
+    For LEAD_GENERATION campaigns pass lead_form instead of destination_url."""
     try:
-        out = _cp.create_single_image_ad(
-            account_id, campaign_id, image_path, intro_text, headline,
-            destination_url, call_to_action, owner_org_urn or None, status,
-        )
+        if lead_form.strip():
+            out = _cp.create_lead_gen_image_ad(
+                account_id, campaign_id, image_path, intro_text, headline,
+                lead_form.strip(), call_to_action, owner_org_urn or None, status,
+            )
+        elif not destination_url.strip():
+            return ("Error: set destination_url (URL-click ad) or lead_form "
+                    "(lead-gen ad for LEAD_GENERATION ad sets).")
+        else:
+            out = _cp.create_single_image_ad(
+                account_id, campaign_id, image_path, intro_text, headline,
+                destination_url, call_to_action, owner_org_urn or None, status,
+            )
+        form_line = f"\nLead form: {out['lead_form']}" if out.get("lead_form") else ""
         return (
             "Single-image ad created.\n"
             f"Creative: {out['creative']}\n"
             f"Post: {out['post_urn']}\n"
-            f"Image: {out['image_urn']}"
+            f"Image: {out['image_urn']}" + form_line
         )
     except Exception as e:
         return f"Error creating single-image ad: {e}"
@@ -3392,13 +3413,17 @@ async def create_single_image_ad(
 async def bulk_create_single_image_ads(
     account_id: str = Field(description="LinkedIn Ad Account ID"),
     campaign_id: str = Field(description="Campaign (ad set) ID for all ads"),
-    csv_path: str = Field(description="CSV columns: image_path, intro_text, headline, call_to_action, destination_url"),
+    csv_path: str = Field(description="CSV columns: image_path, intro_text, headline, call_to_action, destination_url, and optionally lead_form (per-row Lead Gen Form for LEAD_GENERATION ad sets)"),
     owner_org_urn: str = Field(default="", description="Organization (Page) URN. Defaults to LINKEDIN_ORG_URN."),
     status: str = Field(default="DRAFT", description="DRAFT (safe, no spend), ACTIVE (goes to review), or PAUSED (only after approved)"),
+    default_lead_form: str = Field(default="", description="Lead Gen Form applied to every row that lacks its own lead_form column value (URN, numeric ID, or name substring)"),
+    formless: bool = Field(default=False, description="Draft every ad with image + copy only (no URL, no form) — for LEAD_GENERATION ad sets where the user attaches forms manually in Campaign Manager before launch"),
 ) -> str:
-    """Create many single-image ads from a CSV (one ad per row)."""
+    """Create many single-image ads from a CSV (one ad per row). Rows with lead_form become lead-gen ads."""
     try:
-        results = _cp.bulk_create_from_csv(account_id, campaign_id, csv_path, owner_org_urn or None, status)
+        results = _cp.bulk_create_from_csv(account_id, campaign_id, csv_path, owner_org_urn or None, status,
+                                           default_lead_form=default_lead_form.strip() or None,
+                                           formless=formless)
         ok = sum(1 for r in results if r.get("ok"))
         lines = [("OK  " if r.get("ok") else "ERR ") + f"row {r['row']}: " + (r.get("creative", "") if r.get("ok") else r.get("error", "")) for r in results]
         return f"Bulk create: {ok}/{len(results)} ads created.\n" + "\n".join(lines)
